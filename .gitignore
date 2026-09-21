@@ -1,0 +1,29 @@
+# ---- 构建产物 / 二进制 ----
+/UC下载器.exe
+/UC下载器.ico
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# ---- 下载产物 ----
+*.mp4
+*.parts.json
+
+# ---- 运行时 / 本地敏感文件（Cookie 等同账号登录态，绝不入库）----
+url.txt
+cookie.txt
+curl_test.txt
+selftest_result.txt
+crash.log
+*.log
+
+# ---- 与项目无关的本地文件 ----
+ref/
+规范.txt
+
+# ---- 图标/图片素材（不入库）----
+icon/
+*.png
+*.ico
