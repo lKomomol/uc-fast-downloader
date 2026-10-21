@@ -340,9 +340,304 @@ class Downloader:
         return zeros
 
 
+
+
 # ---------------------------------------------------------------- 界面
 
 LOG_COLORS = {"info": "#222222", "ok": "#137333", "warn": "#b06000", "err": "#c5221f"}
+
+
+def _short(text, n=76):
+    text = str(text or "")
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+class TaskQueue:
+    """给每个任务套一层队列，下载线程只要往这里丢事件，界面按任务分发"""
+
+    def __init__(self, app_q, task_id):
+        self.app_q = app_q
+        self.task_id = task_id
+
+    def put(self, event):
+        self.app_q.put(("task", self.task_id, event))
+
+
+class DownloadTask:
+    _next_id = 0
+
+    def __init__(self, app, link, pwd_id, passcode):
+        DownloadTask._next_id += 1
+        self.id = f"task-{DownloadTask._next_id}"
+        self.app = app
+        self.link = link
+        self.pwd_id = pwd_id
+        self.code = passcode
+        self.passcode = passcode
+        self.title = f"分享 {pwd_id}"
+        self.out_dir = app.current_out_dir()
+        self.out_path = None
+        self.conns = app.selected_conns()
+        self.chunk = app.selected_chunk()
+        self.parsed = None
+
+        self.status = "resolving"       # resolving / downloading / pausing / paused / done / failed / needs_code
+        self.pause_requested = False
+        self.error = ""
+        self.stop_event = threading.Event()
+        self.cancel_resolve = threading.Event()
+        self.worker = None
+
+        self.done = 0
+        self.total = 0
+        self.inst = 0.0
+        self.avg = 0.0
+        self.left = 0.0
+        self.chunks_done = 0
+        self.chunks_total = 0
+        self.started_at = time.time()
+
+        self.q = TaskQueue(app.q, self.id)
+        self.row = None
+        self.name_lbl = None
+        self.pb = None
+        self.status_lbl = None
+        self.btn_pause = None
+        self.btn_del = None
+
+    # -- 行界面 --
+    def build_row(self, parent):
+        row = self.app.tk.Frame(parent, bg="#ffffff", highlightbackground="#d9d9d9",
+                                highlightthickness=1)
+        row.pack(fill="x", padx=2, pady=2)
+        row.columnconfigure(0, weight=1)
+        self.row = row
+
+        self.name_lbl = self.app.tk.Label(
+            row, text=_short(self.title), anchor="w", bg="#ffffff",
+            font=("Microsoft YaHei UI", 9, "bold"))
+        self.name_lbl.grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=(5, 0))
+
+        self.btn_pause = self.app.tk.Button(
+            row, text="⏸", width=3, command=lambda: self.app.toggle_pause(self),
+            relief="groove", borderwidth=1, bg="#f5f5f5", activebackground="#e8e8e8",
+            font=("Segoe UI Symbol", 11))
+        self.btn_pause.grid(row=0, column=1, rowspan=3, sticky="ns", padx=(2, 0), pady=5)
+
+        self.btn_del = self.app.tk.Button(
+            row, text="✕", width=3, command=lambda: self.app.remove_task(self),
+            relief="groove", borderwidth=1, bg="#f5f5f5", fg="#c5221f",
+            activebackground="#ffe8e6", activeforeground="#c5221f",
+            font=("Segoe UI Symbol", 10))
+        self.btn_del.grid(row=0, column=2, rowspan=3, sticky="ns", padx=(2, 6), pady=5)
+
+        self.pb = self.app.ttk.Progressbar(row, maximum=100.0, mode="determinate")
+        self.pb.grid(row=1, column=0, sticky="ew", padx=(8, 4), pady=(4, 2))
+
+        self.status_lbl = self.app.tk.Label(
+            row, text="解析中…", anchor="w", bg="#ffffff", fg="#555555",
+            font=("Consolas", 8))
+        self.status_lbl.grid(row=2, column=0, sticky="ew", padx=(8, 4), pady=(0, 5))
+
+        self.update_row()
+
+    def update_row(self):
+        if self.row is None:
+            return
+        total = self.total or 0
+        pct = (self.done / total * 100.0) if total else (100.0 if self.status == "done" else 0.0)
+        pct = max(0.0, min(100.0, pct))
+        self.pb.configure(value=pct)
+        self.name_lbl.configure(text=_short(self.title))
+
+        if self.status == "resolving":
+            text = "解析中…"
+            color = "#555555"
+        elif self.status == "downloading":
+            if total:
+                text = (f"{self.done / 1048576:8.1f} / {total / 1048576:.1f} MB"
+                        f" · {self.inst:5.1f} MB/s · {pct:4.1f}%")
+                if self.left:
+                    text += f" · 剩 {self.left:.0f}s"
+            else:
+                text = "连接中…"
+            color = "#333333"
+        elif self.status == "pausing":
+            text = "正在暂停…"
+            color = "#b06000"
+        elif self.status == "paused":
+            text = f"已暂停 · {self.done / 1048576:.1f} / {total / 1048576:.1f} MB（{pct:.1f}%）"
+            color = "#b06000"
+        elif self.status == "done":
+            text = f"完成 · {total / 1048576:.1f} MB"
+            color = "#137333"
+        elif self.status == "needs_code":
+            text = "需要提取码"
+            color = "#c5221f"
+        else:
+            text = "失败：" + _short(self.error or "未知错误", 90)
+            color = "#c5221f"
+
+        self.status_lbl.configure(text=text, fg=color)
+
+        if self.status in ("resolving", "downloading"):
+            self.btn_pause.configure(text="⏸", state="normal")
+        elif self.status == "pausing":
+            self.btn_pause.configure(text="…", state="disabled")
+        elif self.status == "done":
+            self.btn_pause.configure(text="✓", state="disabled")
+        else:
+            self.btn_pause.configure(text="▶", state="normal")
+
+        self.app.refresh_title()
+
+    # -- 解析 --
+    def start_resolve(self):
+        self.pause_requested = False
+        self.cancel_resolve = threading.Event()
+        self.stop_event = threading.Event()
+        self.status = "resolving"
+        self.error = ""
+        self.update_row()
+        self.worker = threading.Thread(target=self._resolve_worker, daemon=True)
+        self.worker.start()
+
+    def _resolve_worker(self):
+        cancel = self.cancel_resolve
+        try:
+            parsed = uc_api.resolve_share(
+                self.pwd_id, self.code, self.app.store.header(),
+                on_step=lambda m: self.q.put(("log", m, "info")),
+                cancel=cancel)
+            self.q.put(("resolved", parsed))
+        except uc_api.ShareCancelled:
+            self.q.put(("resolve_cancelled", None))
+        except Exception as e:
+            self.q.put(("resolve_failed", (str(e), getattr(e, "code", None))))
+
+    def on_resolved(self, parsed):
+        if self.pause_requested or self.status != "resolving":
+            self.mark_paused()
+            return
+        self.parsed = parsed
+        self.title = parsed.get("filename") or self.title
+        self.total = int(parsed.get("size") or 0)
+        if not self.out_path:
+            self.out_path = self.app.pick_out_path(self, self.title)
+        self.status = "downloading"
+        self.started_at = time.time()
+        self.update_row()
+        mode = parsed.get("mode")
+        mode_text = "登录态（单连接约 500KB/s）" if mode == "login" else (
+            "游客态（单连接约 100KB/s）" if mode == "guest" else "未知")
+        self.app.msg(f"[{self.title}] 解析完成，{mode_text}；保存到 {self.out_path}", "ok")
+        if os.path.exists(self.out_path + ".parts.json"):
+            self.app.msg(f"[{self.title}] 发现上次进度，将自动续传。", "warn")
+        self.start_download(parsed)
+
+    def start_download(self, parsed):
+        self.status = "downloading"
+        self.pause_requested = False
+        self.error = ""
+        self.stop_event = threading.Event()
+        self.update_row()
+        self.worker = threading.Thread(target=self._download_worker, args=(parsed,), daemon=True)
+        self.worker.start()
+
+    def _download_worker(self, parsed):
+        try:
+            Downloader(parsed, self.out_path, self.conns, self.chunk, self.q, self.stop_event).run()
+        except Exception as e:
+            self.q.put(("failed", f"{type(e).__name__}: {e}"))
+
+    # -- 暂停 / 继续 --
+    def pause(self):
+        if self.status not in ("resolving", "downloading"):
+            return
+        self.pause_requested = True
+        self.cancel_resolve.set()
+        self.stop_event.set()
+        self.status = "pausing"
+        self.update_row()
+        self.app.msg(f"[{self.title}] 正在暂停，进度会保存…", "warn")
+
+    def resume(self):
+        if self.status not in ("paused", "failed", "needs_code"):
+            return
+        self.pause_requested = False
+        self.error = ""
+        self.start_resolve()
+
+    def mark_paused(self):
+        if self.status == "paused":
+            return
+        self.status = "paused"
+        self.pause_requested = False
+        self.update_row()
+        self.app.msg(f"[{self.title}] 已暂停，进度已保存；点 ▶ 继续，不用重新粘链接。", "warn")
+
+    def on_progress(self, p):
+        self.done = p.get("done") or 0
+        self.total = p.get("total") or self.total
+        self.inst = p.get("inst") or 0.0
+        self.avg = p.get("avg") or 0.0
+        self.left = p.get("left") or 0.0
+        self.chunks_done = p.get("chunks_done") or 0
+        self.chunks_total = p.get("chunks_total") or 0
+        self.update_row()
+
+    def on_done(self, info):
+        self.status = "done"
+        self.done = info.get("total") or self.total
+        self.total = self.done
+        self.inst = 0.0
+        self.left = 0.0
+        self.update_row()
+        secs = info.get("seconds") or 0.0
+        speed = (self.total / secs / 1048576.0) if secs else 0.0
+        self.app.msg(f"[{self.title}] 下载完成：{info.get('path')}（{self.total / 1048576:.1f} MB，{speed:.1f} MB/s）", "ok")
+
+    def on_failed(self, msg):
+        if self.pause_requested:
+            self.mark_paused()
+            return
+        self.status = "failed"
+        self.error = str(msg)
+        self.update_row()
+        self.app.msg(f"[{self.title}] 下载失败：{self.error}", "err")
+
+    def on_resolve_failed(self, payload):
+        msg, code = payload if isinstance(payload, (tuple, list)) else (str(payload), None)
+        if self.pause_requested:
+            self.mark_paused()
+            return
+        if code in uc_api.NEED_PASSCODE or code in uc_api.BAD_PASSCODE or "提取码" in str(msg):
+            self.status = "needs_code"
+            self.error = str(msg)
+            self.update_row()
+            self.app.ask_passcode(self, str(msg), code in uc_api.BAD_PASSCODE)
+            return
+        self.status = "failed"
+        self.error = str(msg)
+        self.update_row()
+        self.app.msg(f"[{self.title}] 解析失败：{self.error}", "err")
+
+    def handle_event(self, ev):
+        kind = ev[0]
+        if kind == "log":
+            self.app.msg(f"[{self.title}] {ev[1]}", ev[2] if len(ev) > 2 else "info")
+        elif kind == "progress":
+            self.on_progress(ev[1])
+        elif kind == "resolved":
+            self.on_resolved(ev[1])
+        elif kind == "resolve_cancelled":
+            self.mark_paused()
+        elif kind == "resolve_failed":
+            self.on_resolve_failed(ev[1])
+        elif kind == "done":
+            self.on_done(ev[1])
+        elif kind == "failed":
+            self.on_failed(ev[1])
 
 
 class App:
@@ -355,13 +650,9 @@ class App:
         self.filedialog = filedialog
         self.root = root
         self.q = queue.Queue()
-        self.stop_event = threading.Event()
-        self.worker = None
-        self.dl = None
-        self._resolving = False
-        self._resolve_gen = 0
-        self._resolve_timer = None
-        self._resolve_cancel = threading.Event()
+        self.tasks = {}
+        self.store = uc_api.CookieStore()
+        self.login_info = self.store.info()
         self.default_out_dir = os.path.join(os.path.expanduser("~"), "Downloads")
         saved_dir = uc_api.load_settings().get("out_dir")
         if out_dir:
@@ -371,13 +662,11 @@ class App:
         else:
             self.out_dir = self.default_out_dir
         self.out_dir = os.path.normpath(self.out_dir)
-        self.out_path = None
-        self.store = uc_api.CookieStore()
-        self.login_info = self.store.info()
+        self._closing = False
 
         root.title(APP_TITLE)
-        root.geometry("780x600")
-        root.minsize(700, 540)
+        root.geometry("900x720")
+        root.minsize(760, 600)
         try:
             tkfont.nametofont("TkDefaultFont").configure(family="Microsoft YaHei UI", size=10)
             tkfont.nametofont("TkTextFont").configure(family="Microsoft YaHei UI", size=10)
@@ -386,7 +675,7 @@ class App:
 
         pad = {"padx": 10, "pady": 4}
 
-        # ① 分享链接（推荐）
+        # ① 分享链接
         linkbar = ttk.Frame(root)
         linkbar.pack(fill="x", **pad)
         ttk.Label(linkbar, text="① 分享链接").pack(side="left")
@@ -412,11 +701,10 @@ class App:
         # 按钮行
         bar = ttk.Frame(root)
         bar.pack(fill="x", **pad)
-        self.btn_qr = ttk.Button(bar, text="粘贴二维码", command=self.paste_qr)
         self.btn_start = ttk.Button(bar, text="解析并开始下载", command=self.start)
-        self.btn_stop = ttk.Button(bar, text="停止", command=self.stop, state="disabled")
-        self.btn_open = ttk.Button(bar, text="打开所在文件夹", command=self.open_folder)
-        for w in (self.btn_qr, self.btn_start, self.btn_stop, self.btn_open):
+        self.btn_qr = ttk.Button(bar, text="粘贴二维码", command=self.paste_qr)
+        self.btn_open = ttk.Button(bar, text="打开下载目录", command=self.open_folder)
+        for w in (self.btn_start, self.btn_qr, self.btn_open):
             w.pack(side="left", padx=3)
         ttk.Label(bar, text="连接数").pack(side="left", padx=(14, 2))
         self.conns = ttk.Combobox(bar, width=4, values=("16", "32", "48", "64", "96", "128", "192"),
@@ -427,7 +715,7 @@ class App:
         self.chunk.pack(side="left")
         self.apply_defaults()
 
-        # ③ 保存位置
+        # ② 保存位置
         savebar = ttk.Frame(root)
         savebar.pack(fill="x", padx=10, pady=(0, 2))
         ttk.Label(savebar, text="② 保存到").pack(side="left")
@@ -439,21 +727,38 @@ class App:
         self.btn_default = ttk.Button(savebar, text="默认", width=6, command=self.reset_dir)
         self.btn_default.pack(side="left", padx=(4, 0))
 
-        # ④ 进度条
-        ttk.Label(root, text="③ 进度：").pack(anchor="w", **pad)
-        self.pb = ttk.Progressbar(root, maximum=100.0, mode="determinate")
-        self.pb.pack(fill="x", padx=10)
-        self.lbl_size = ttk.Label(root, text="0.0 / 0.0 MB          瞬时 0.00 MB/s     均速 0.00 MB/s",
-                                  font=("Consolas", 10))
-        self.lbl_size.pack(anchor="w", **pad)
-        self.lbl_chunk = ttk.Label(root, text="已完成 0/0 块          预计剩余 -- 秒",
-                                   font=("Consolas", 10))
-        self.lbl_chunk.pack(anchor="w", padx=10)
-        # ④ 日志区
+        # ③ 下载列表
+        head = ttk.Frame(root)
+        head.pack(fill="x", padx=10, pady=(6, 0))
+        ttk.Label(head, text="③ 下载列表").pack(side="left")
+        ttk.Label(head, text="可以连续添加多个任务；⏸ 暂停 / ▶ 继续 / ✕ 移除（文件保留）",
+                  foreground="#777777", font=("Microsoft YaHei UI", 8)).pack(side="left", padx=8)
+
+        list_frame = ttk.Frame(root)
+        list_frame.pack(fill="x", padx=10, pady=(2, 4))
+        self.task_canvas = tk.Canvas(list_frame, height=240, highlightthickness=0, bg="#fbfbfb")
+        self.task_scroll = ttk.Scrollbar(list_frame, command=self.task_canvas.yview)
+        self.task_inner = tk.Frame(self.task_canvas, bg="#fbfbfb")
+        self._task_window = self.task_canvas.create_window((0, 0), window=self.task_inner, anchor="nw")
+        self.task_inner.bind("<Configure>",
+                             lambda e: self.task_canvas.configure(scrollregion=self.task_canvas.bbox("all")))
+        self.task_canvas.bind("<Configure>",
+                              lambda e: self.task_canvas.itemconfigure(self._task_window, width=e.width))
+        self.task_canvas.configure(yscrollcommand=self.task_scroll.set)
+        self.task_canvas.pack(side="left", fill="both", expand=True)
+        self.task_scroll.pack(side="right", fill="y")
+        self.task_canvas.bind("<Enter>", lambda e: self.task_canvas.bind_all("<MouseWheel>", self._on_wheel))
+        self.task_canvas.bind("<Leave>", lambda e: self.task_canvas.unbind_all("<MouseWheel>"))
+
+        self.empty_lbl = tk.Label(self.task_inner, text="还没有任务：粘分享链接或二维码，点「解析并开始下载」",
+                                  bg="#fbfbfb", fg="#888888", font=("Microsoft YaHei UI", 9))
+        self.empty_lbl.pack(pady=40)
+
+        # ④ 日志
         ttk.Label(root, text="④ 日志：").pack(anchor="w", **pad)
         lb = ttk.Frame(root)
         lb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        self.log = tk.Text(lb, height=8, wrap="word", state="disabled", relief="solid",
+        self.log = tk.Text(lb, height=7, wrap="word", state="disabled", relief="solid",
                            borderwidth=1, font=("Microsoft YaHei UI", 9))
         lsb = ttk.Scrollbar(lb, command=self.log.yview)
         self.log.configure(yscrollcommand=lsb.set)
@@ -463,11 +768,11 @@ class App:
             self.log.tag_configure(k, foreground=c)
 
         if self.login_info:
-            self.msg("准备就绪：已保存登录态，直接粘分享链接就能全速下载。", "ok")
+            self.msg("准备就绪：已保存登录态。粘分享链接/二维码即可，支持一次加多个任务。", "ok")
         else:
-            self.msg("准备就绪：粘分享链接 + 提取码即可。想快 5 倍，点右上「登录」用手机号验证码登一次。", "info")
+            self.msg("准备就绪：粘分享链接/二维码即可，支持一次加多个任务。想快 5 倍，点右上「登录」登一次。", "info")
+
         self.icon_loaded = self._load_icon()
-        self._closing = False
         self._poll_id = self.root.after(400, self.poll)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -507,17 +812,6 @@ class App:
         self.log.insert("end", f"[{ts}] {text}\n", kind)
         self.log.see("end")
         self.log.configure(state="disabled")
-
-    def set_busy(self, busy):
-        self.btn_qr.configure(state="disabled" if busy else "normal")
-        self.btn_start.configure(state="disabled" if busy else "normal")
-        self.btn_stop.configure(state="normal" if busy else "disabled")
-        self.conns.configure(state="disabled" if busy else "readonly")
-        self.chunk.configure(state="disabled" if busy else "readonly")
-        for w in (self.link, self.passcode, self.dir_entry):
-            w.configure(state="disabled" if busy else "normal")
-        for w in (self.btn_login, self.btn_logout, self.btn_browse, self.btn_default):
-            w.configure(state="disabled" if busy else "normal")
 
     def _update_login_ui(self):
         info = self.login_info or {}
@@ -560,23 +854,22 @@ class App:
 
     def open_folder(self):
         try:
-            if self.out_path and os.path.isfile(self.out_path):
-                subprocess.Popen(["explorer", "/select,", os.path.normpath(self.out_path)])
-            else:
-                target = self.out_dir_var.get().strip() or self.default_out_dir
-                os.makedirs(target, exist_ok=True)
-                os.startfile(os.path.normpath(target))
+            target = self.out_dir_var.get().strip() or self.default_out_dir
+            target = os.path.expandvars(os.path.expanduser(target))
+            os.makedirs(target, exist_ok=True)
+            os.startfile(os.path.normpath(target))
         except Exception as e:
             self.msg(f"打不开文件夹：{e}", "warn")
 
     def on_close(self):
-        """关窗：先取消待触发的定时回调，再置停止标志、销毁窗口
-
-        下载线程是 daemon 线程，主线程一结束它们会随进程一起被系统回收；
-        这里不需要 join（也不会卡住关窗）。
-        """
+        """关窗：置停止标志，让下载线程尽量保存进度"""
         self._closing = True
-        self.stop_event.set()
+        for task in list(self.tasks.values()):
+            try:
+                task.cancel_resolve.set()
+                task.stop_event.set()
+            except Exception:
+                pass
         try:
             if self._poll_id:
                 self.root.after_cancel(self._poll_id)
@@ -623,7 +916,6 @@ class App:
     def logout(self):
         self.store.clear()
         try:
-            import shutil
             shutil.rmtree(uc_api.PROFILE_DIR, ignore_errors=True)
         except Exception:
             pass
@@ -632,10 +924,136 @@ class App:
         self.apply_defaults()
         self.msg("已清除登录态，回到游客模式。", "warn")
 
-    # -- 二维码 --
+    # -- 任务 --
+    def current_out_dir(self):
+        d = self.out_dir_var.get().strip().strip('"') if hasattr(self, "out_dir_var") else self.out_dir
+        if not d:
+            d = self.default_out_dir
+        d = os.path.expandvars(os.path.expanduser(d))
+        os.makedirs(d, exist_ok=True)
+        self.out_dir = os.path.normpath(d)
+        return self.out_dir
+
+    def selected_conns(self):
+        try:
+            return max(1, int(self.conns.get()))
+        except Exception:
+            return 64 if self.login_info else 128
+
+    def selected_chunk(self):
+        try:
+            return max(1, int(self.chunk.get().split()[0])) * 1024 * 1024
+        except Exception:
+            return (4 if self.login_info else 1) * 1024 * 1024
+
+    def pick_out_path(self, task, filename):
+        if task.out_path:
+            return task.out_path
+        filename = sanitize(filename)
+        base, ext = os.path.splitext(filename)
+        candidate = os.path.join(task.out_dir, filename)
+        used = {os.path.normcase(t.out_path) for t in self.tasks.values()
+                if t is not task and t.out_path}
+        if os.path.exists(candidate + ".parts.json") and os.path.normcase(candidate) not in used:
+            return candidate
+        n = 1
+        while os.path.exists(candidate) or os.path.normcase(candidate) in used:
+            n += 1
+            candidate = os.path.join(task.out_dir, f"{base} ({n}){ext}")
+        return candidate
+
+    def add_task(self, task):
+        task.build_row(self.task_inner)
+        self.tasks[task.id] = task
+        try:
+            self.empty_lbl.pack_forget()
+        except Exception:
+            pass
+        self._refresh_scroll()
+        self.msg(f"已加入下载列表：{task.pwd_id}，开始解析…", "info")
+
+    def remove_task(self, task):
+        if task.id not in self.tasks:
+            return
+        try:
+            task.cancel_resolve.set()
+            task.stop_event.set()
+        except Exception:
+            pass
+        self.tasks.pop(task.id, None)
+        try:
+            if task.row is not None:
+                task.row.destroy()
+        except Exception:
+            pass
+        if not self.tasks:
+            try:
+                self.empty_lbl.pack(pady=40)
+            except Exception:
+                pass
+        self._refresh_scroll()
+        self.msg(f"已移除任务：{task.title}（已下载的文件保留）", "warn")
+
+    def toggle_pause(self, task):
+        if task.status in ("resolving", "downloading"):
+            task.pause()
+        elif task.status in ("paused", "failed", "needs_code"):
+            task.resume()
+
+    def _refresh_scroll(self):
+        try:
+            self.task_inner.update_idletasks()
+            self.task_canvas.configure(scrollregion=self.task_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_wheel(self, event):
+        try:
+            self.task_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except Exception:
+            pass
+
+    def refresh_title(self):
+        if self._closing:
+            return
+        active = [t for t in self.tasks.values()
+                  if t.status in ("resolving", "downloading", "pausing")]
+        if active:
+            speed = sum(t.inst for t in active if t.status == "downloading")
+            self.root.title(f"{APP_TITLE} — {len(active)} 个任务进行中 · {speed:.1f} MB/s")
+        else:
+            self.root.title(APP_TITLE)
+
+    # -- 开始任务 / 二维码 --
+    def start(self):
+        link = self.link.get().strip()
+        if not link:
+            self.msg("先把分享链接粘进「① 分享链接」（有提取码就填上）。", "err")
+            self.link.focus_set()
+            return
+        try:
+            pwd_id, pwd = uc_api.parse_share(link)
+        except Exception as e:
+            self.msg(f"链接解析失败：{e}", "err")
+            self.link.focus_set()
+            return
+        code = self.passcode.get().strip() or pwd
+        try:
+            self.current_out_dir()
+        except Exception as e:
+            self.msg(f"保存目录不可用：{self.out_dir_var.get()}（{e}）", "err")
+            return
+        self._save_out_dir()
+
+        task = DownloadTask(self, link, pwd_id, code)
+        self.add_task(task)
+        self.link.delete(0, "end")
+        self.passcode.delete(0, "end")
+        task.start_resolve()
+
     def paste_qr(self):
-        """从剪贴板读二维码，识别后填入链接/提取码并自动开始"""
-        if getattr(self, "_closing", False):
+        """从剪贴板读二维码，识别后填入链接/提取码并开始"""
+        if self._closing:
             return
         self.msg("正在从剪贴板读取二维码…", "info")
         threading.Thread(target=self._qr_worker, daemon=True).start()
@@ -649,139 +1067,33 @@ class App:
         except Exception as e:
             self.q.put(("qr_failed", f"识别失败：{type(e).__name__}: {e}"))
 
-    # -- 启动下载 --
-    def start(self):
-        link = self.link.get().strip()
-        if not link:
-            self.msg("先把分享链接粘进「① 分享链接」（有提取码就填上）。", "err")
+    def ask_passcode(self, task, msg, bad=False):
+        """只有服务端明确说需要提取码时才弹这个框；输入后自动重试"""
+        if task.id not in self.tasks:
             return
-        try:
-            pwd_id, pwd = uc_api.parse_share(link)
-        except Exception as e:
-            self.msg(f"链接解析失败：{e}", "err")
+        from tkinter import simpledialog
+        prompt = f"分享「{task.title}」需要提取码："
+        if bad:
+            prompt = f"提取码不对，请重新输入。\n\n{msg}"
+        while True:
+            code = simpledialog.askstring("需要提取码", prompt, parent=self.root)
+            if code is None:
+                task.status = "failed"
+                task.error = "未输入提取码"
+                task.update_row()
+                self.msg(f"[{task.title}] 未输入提取码；任务留在列表里，点 ▶ 可以重试。", "warn")
+                return
+            code = code.strip()
+            if code:
+                break
+        if task.id not in self.tasks:
             return
-        code = self.passcode.get().strip() or pwd
-        if not self.login_info:
-            self.msg("游客模式：单连接约 100KB/s；要点「登录」才能快 5 倍。", "warn")
-        self.stop_event.clear()
-        self._resolving = True
-        self._resolve_gen += 1
-        gen = self._resolve_gen
-        self._resolve_cancel = threading.Event()
-        self.msg(f"正在解析分享 {pwd_id} …", "info")
-        self.set_busy(True)
-        self.pb.configure(value=0.0)
-        try:
-            threading.Thread(target=self._resolve_worker,
-                             args=(pwd_id, code, gen, self._resolve_cancel), daemon=True).start()
-        except Exception as e:
-            self._resolving = False
-            self._resolve_gen += 1
-            self._cancel_resolve_timer()
-            self.set_busy(False)
-            self.msg(f"启动解析线程失败：{type(e).__name__}: {e}", "err")
-            return
-        if self._resolve_timer:
-            try:
-                self.root.after_cancel(self._resolve_timer)
-            except Exception:
-                pass
-        self._resolve_timer = self.root.after(45000, self._resolve_timeout)
+        task.code = code
+        task.passcode = code
+        self.msg(f"[{task.title}] 已输入提取码，重新解析…", "info")
+        task.start_resolve()
 
-    def _resolve_worker(self, pwd_id, code, gen, cancel_event):
-        try:
-            parsed = uc_api.resolve_share(
-                pwd_id, code, self.store.header(),
-                on_step=lambda m: self.q.put(("log", m, "info")),
-                cancel=cancel_event)
-            self.q.put(("resolved", (gen, parsed)))
-        except uc_api.ShareCancelled:
-            self.q.put(("resolve_cancelled", (gen,)))
-        except Exception as e:
-            import traceback
-            try:
-                os.makedirs(uc_api.APP_DIR, exist_ok=True)
-                with open(os.path.join(uc_api.APP_DIR, "error.log"), "a", encoding="utf-8") as f:
-                    f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n" + traceback.format_exc() + "\n")
-            except Exception:
-                pass
-            self.q.put(("resolve_failed", (gen, str(e))))
-
-    def _cancel_resolve_timer(self):
-        if self._resolve_timer:
-            try:
-                self.root.after_cancel(self._resolve_timer)
-            except Exception:
-                pass
-            self._resolve_timer = None
-
-    def _resolve_timeout(self):
-        self._resolve_timer = None
-        if self._resolving:
-            self.msg("解析超过 45 秒，网络可能卡住了；可以点「停止」取消，或检查网络后重试。", "warn")
-
-    def _begin_download(self, parsed):
-        d = self.out_dir_var.get().strip().strip('"')
-        if not d:
-            d = self.default_out_dir
-        d = os.path.expandvars(os.path.expanduser(d))
-        try:
-            os.makedirs(d, exist_ok=True)
-        except Exception as e:
-            self.msg(f"保存目录不可用：{d}（{e}）", "err")
-            self.set_busy(False)
-            return
-        self.out_dir = os.path.normpath(d)
-        self.out_dir_var.set(self.out_dir)
-        self._save_out_dir()
-        name = parsed.get("filename") or filename_from_url(parsed["url"])
-        self.out_path = os.path.join(self.out_dir, name)
-        size = parsed.get("size") or 0
-        extra = f"（{size/1048576:.1f} MB）" if size else ""
-        self.msg(f"目标文件：{name}{extra}", "ok")
-        more = [f for f in (parsed.get("files") or []) if not f.get("dir")]
-        if len(more) > 1:
-            self.msg(f"分享里有 {len(more)} 个文件，这次先下第一个：{name}", "warn")
-        if parsed.get("mode") == "login":
-            self.msg("直链已确认是登录态：单连接约 500KB/s。", "ok")
-        elif parsed.get("mode") == "guest":
-            self.msg("直链是游客态：单连接约 100KB/s；登录后约 5 倍。", "warn")
-        if os.path.exists(self.out_path + ".parts.json"):
-            self.msg("检测到同名文件的未完成进度，将自动续传。", "warn")
-
-        try:
-            chunk_bytes = int(self.chunk.get().split()[0]) * 1024 * 1024
-            conns = int(self.conns.get())
-        except Exception:
-            chunk_bytes = (4 if self.login_info else 1) * 1024 * 1024
-            conns = 64 if self.login_info else 128
-
-        self.stop_event.clear()
-        self.set_busy(True)
-        self.pb.configure(value=0.0)
-        dl = Downloader(parsed, self.out_path, conns, chunk_bytes, self.q, self.stop_event)
-        self.dl = dl
-        self.worker = threading.Thread(target=dl.run, daemon=True)
-        try:
-            self.worker.start()
-        except Exception as e:
-            self.msg(f"启动下载线程失败：{type(e).__name__}: {e}", "err")
-            self.set_busy(False)
-
-    def stop(self):
-        self.stop_event.set()
-        if self._resolving:
-            # 解析线程可能卡在网络调用里，先让界面立刻恢复
-            self._resolve_cancel.set()
-            self._resolve_gen += 1
-            self._resolving = False
-            self._cancel_resolve_timer()
-            self.set_busy(False)
-            self.msg("已取消解析。", "warn")
-        elif self.worker and self.worker.is_alive():
-            self.msg("正在停止…（已下载的进度会保留，稍后可续传）", "warn")
-
-    # -- 事件轮询 --
+    # -- 事件循环 --
     def poll(self):
         if self._closing:
             return
@@ -789,37 +1101,13 @@ class App:
             while True:
                 ev = self.q.get_nowait()
                 kind = ev[0]
-                if kind == "log":
+                if kind == "task":
+                    _, task_id, inner = ev
+                    task = self.tasks.get(task_id)
+                    if task is not None:
+                        task.handle_event(inner)
+                elif kind == "log":
                     self.msg(ev[1], ev[2] if len(ev) > 2 else "info")
-                elif kind == "progress":
-                    self.update_progress(ev[1])
-                elif kind == "done":
-                    self.on_done(ev[1])
-                elif kind == "resolved":
-                    gen, parsed = ev[1]
-                    if gen != self._resolve_gen:
-                        continue
-                    self._resolving = False
-                    self._cancel_resolve_timer()
-                    self._begin_download(parsed)
-                elif kind == "resolve_failed":
-                    gen, text = ev[1]
-                    if gen != self._resolve_gen:
-                        continue
-                    self._resolving = False
-                    self._cancel_resolve_timer()
-                    self.msg(text, "err")
-                    if "提取码" in text:
-                        self.passcode.focus_set()
-                    self.set_busy(False)
-                elif kind == "resolve_cancelled":
-                    gen = ev[1][0]
-                    if gen != self._resolve_gen:
-                        continue
-                    self._resolving = False
-                    self._cancel_resolve_timer()
-                    self.msg("已取消解析。", "warn")
-                    self.set_busy(False)
                 elif kind == "qr_ok":
                     info = ev[1]
                     self.link.delete(0, "end")
@@ -827,15 +1115,9 @@ class App:
                     self.passcode.delete(0, "end")
                     if info.get("passcode"):
                         self.passcode.insert(0, info["passcode"])
-                    if self._resolving or (self.worker is not None and self.worker.is_alive()):
-                        self.msg("二维码已识别并填入；当前有任务在跑，等它结束再点「解析并开始下载」。", "warn")
-                        continue
-                    if not info.get("passcode"):
-                        # 只有链接：提取码可能是对方单独发的，留给用户补
-                        self.passcode.focus_set()
-                        self.msg("二维码里只有链接；提取码请单独输入。不需要提取码就直接按回车或点「解析并开始下载」。", "warn")
-                        continue
-                    self.msg("二维码识别成功，已填入链接 + 提取码，开始下载。", "ok")
+                        self.msg("二维码识别成功，已填入链接 + 提取码，开始下载。", "ok")
+                    else:
+                        self.msg("二维码里只有链接，先直接开始；如果 UC 提示需要提取码，会弹窗让你输入。", "warn")
                     self.start()
                 elif kind == "qr_failed":
                     self.msg(f"二维码：{ev[1]}", "err")
@@ -848,44 +1130,20 @@ class App:
                     self.login_info = info or {"member_type": "已登录"}
                     self._update_login_ui()
                     self.apply_defaults()
-                    self.msg("登录成功，已切到高速默认值（64 连接 / 4MB）。", "ok")
+                    self.msg("登录成功，新任务会切到高速默认值（64 连接 / 4MB）。", "ok")
                     self.btn_login.configure(state="normal")
                 elif kind == "login_failed":
                     self.msg(f"登录没成功：{ev[1]}", "err")
                     self.btn_login.configure(state="normal")
-                elif kind == "failed":
-                    self.msg(ev[1], "err")
-                    self.msg("提示：分享链接直接再点一次「开始」即可续传。", "warn")
-                    self.set_busy(False)
         except queue.Empty:
             pass
         if not self._closing:
             self._poll_id = self.root.after(400, self.poll)
 
-    def update_progress(self, p):
-        total = p["total"] or 1
-        pct = p["done"] / total * 100.0
-        self.pb.configure(value=pct)
-        self.lbl_size.configure(
-            text=f"{p['done']/1048576:8.1f} / {p['total']/1048576:.1f} MB"
-                 f"      瞬时 {p['inst']:5.2f} MB/s     均速 {p['avg']:5.2f} MB/s")
-        left = f"{p['left']:.0f}" if p["left"] else "--"
-        self.lbl_chunk.configure(
-            text=f"已完成 {p['chunks_done']}/{p['chunks_total']} 块          预计剩余 {left} 秒")
-        self.root.title(f"{APP_TITLE} — {pct:.1f}% · {p['inst']:.1f} MB/s")
-
-    def on_done(self, info):
-        self.pb.configure(value=100.0)
-        self.root.title(f"{APP_TITLE} — 已完成 100%")
-        self.set_busy(False)
-        self.msg(f"✅ 下载完成：{info['path']}", "ok")
-        self.msg(f"耗时 {info['seconds']:.1f} 秒，速度 {info['total']/max(info['seconds'],0.1)/1048576:.2f} MB/s"
-                 + ("（本次为续传）" if info.get("resumed") else ""), "ok")
-        self.msg("点「打开所在文件夹」就能看到文件。", "info")
-
 
 def main():
     import tkinter as tk
+
     args = sys.argv[1:]
     import json
 
@@ -912,7 +1170,6 @@ def main():
 
     # 诊断用：不打开界面，直接跑一次分享解析，结果写到 %LOCALAPPDATA%\UC下载器\resolve_test.txt
     if "--resolve-test" in args:
-        import json
         import traceback
         i = args.index("--resolve-test")
         link = args[i + 1] if i + 1 < len(args) else ""
