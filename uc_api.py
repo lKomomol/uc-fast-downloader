@@ -69,18 +69,46 @@ class LoginError(Exception):
 
 # ---------------------------------------------------------------- 基础工具
 
+SHARE_URL_RE = re.compile(
+    r"(?:https?://)?(?:drive|fast)\.uc\.cn/s/[0-9A-Za-z]+"
+    r"(?:[?&#][^\s一-鿿，。；；、！!？?）)]*)?",
+    re.I,
+)
+PASSCODE_PATTERNS = (
+    r"[?&#](?:pwd|passcode|password|code)=([0-9A-Za-z_-]{2,12})",
+    r"(?:提取码|提取碼|访问码|訪問碼|密码|密碼|口令)"
+    r"\s*[:：=]?\s*([0-9A-Za-z_-]{2,12})",
+    # 英文标签必须前后有边界，避免把链接里的 withcode123 当成 code=123
+    r"(?<![0-9A-Za-z_])(?:pwd|passcode|password|code)(?![0-9A-Za-z_])"
+    r"\s*[:：=]\s*([0-9A-Za-z_-]{2,12})",
+)
+
+
+def extract_share_url(text):
+    """从分享文本/二维码内容里取出 UC 分享链接（保留 ?pwd= 和 #/list/share）"""
+    text = (text or "").strip()
+    m = SHARE_URL_RE.search(text)
+    if not m:
+        return ""
+    url = m.group(0).rstrip(".,;:!?，。；：！？、）)]】》\"'")
+    if not re.match(r"https?://", url, re.I):
+        url = "https://" + url
+    return url
+
+
 def parse_share(text):
     """从分享链接/分享文本里取 (pwd_id, passcode)"""
     text = (text or "").strip()
-    m = re.search(r"(?:drive|fast)\.uc\.cn/s/([0-9A-Za-z]+)", text)
+    url = extract_share_url(text) or text
+    m = re.search(r"(?:drive|fast)\.uc\.cn/s/([0-9A-Za-z]+)", url, re.I)
     if not m:
         m = re.fullmatch(r"([0-9A-Za-z]{8,})", text)
     if not m:
         raise ShareError("没找到分享链接（应该是 https://drive.uc.cn/s/xxxx 这种）")
     pwd_id = m.group(1)
     code = ""
-    for pat in (r"[?&#]pwd=([0-9A-Za-z]+)", r"提取码[：:\s]*([0-9A-Za-z]{4,10})"):
-        mm = re.search(pat, text)
+    for pat in PASSCODE_PATTERNS:
+        mm = re.search(pat, text, re.I)
         if mm:
             code = mm.group(1)
             break
@@ -89,7 +117,7 @@ def parse_share(text):
 
 def looks_like_share(text):
     text = (text or "").strip()
-    return bool(re.search(r"(?:drive|fast)\.uc\.cn/s/", text)) or bool(re.fullmatch(r"[0-9A-Za-z]{8,}", text))
+    return bool(SHARE_URL_RE.search(text)) or bool(re.fullmatch(r"[0-9A-Za-z]{8,}", text))
 
 
 def sanitize(name):

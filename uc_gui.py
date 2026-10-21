@@ -7,7 +7,7 @@
     python uc_gui.py --link "分享链接" [--passcode 1234] [--go]
 
 使用方式：
-    粘分享链接（有提取码就填上），点「解析并开始下载」。
+    粘分享链接/二维码（有提取码就填上），点「解析并开始下载」。
     想快 5 倍可以点「登录」，用手机号+验证码登一次。
 """
 
@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.request
 
 import uc_api
+import qr_tools
 
 APP_TITLE = "UC 多线程下载器"
 if getattr(sys, "frozen", False):          # PyInstaller 单文件模式：用 exe 所在目录
@@ -411,10 +412,11 @@ class App:
         # 按钮行
         bar = ttk.Frame(root)
         bar.pack(fill="x", **pad)
+        self.btn_qr = ttk.Button(bar, text="粘贴二维码", command=self.paste_qr)
         self.btn_start = ttk.Button(bar, text="解析并开始下载", command=self.start)
         self.btn_stop = ttk.Button(bar, text="停止", command=self.stop, state="disabled")
         self.btn_open = ttk.Button(bar, text="打开所在文件夹", command=self.open_folder)
-        for w in (self.btn_start, self.btn_stop, self.btn_open):
+        for w in (self.btn_qr, self.btn_start, self.btn_stop, self.btn_open):
             w.pack(side="left", padx=3)
         ttk.Label(bar, text="连接数").pack(side="left", padx=(14, 2))
         self.conns = ttk.Combobox(bar, width=4, values=("16", "32", "48", "64", "96", "128", "192"),
@@ -507,6 +509,7 @@ class App:
         self.log.configure(state="disabled")
 
     def set_busy(self, busy):
+        self.btn_qr.configure(state="disabled" if busy else "normal")
         self.btn_start.configure(state="disabled" if busy else "normal")
         self.btn_stop.configure(state="normal" if busy else "disabled")
         self.conns.configure(state="disabled" if busy else "readonly")
@@ -628,6 +631,23 @@ class App:
         self._update_login_ui()
         self.apply_defaults()
         self.msg("已清除登录态，回到游客模式。", "warn")
+
+    # -- 二维码 --
+    def paste_qr(self):
+        """从剪贴板读二维码，识别后填入链接/提取码并自动开始"""
+        if getattr(self, "_closing", False):
+            return
+        self.msg("正在从剪贴板读取二维码…", "info")
+        threading.Thread(target=self._qr_worker, daemon=True).start()
+
+    def _qr_worker(self):
+        try:
+            info = qr_tools.read_clipboard_share()
+            self.q.put(("qr_ok", info))
+        except qr_tools.QRCodeError as e:
+            self.q.put(("qr_failed", str(e)))
+        except Exception as e:
+            self.q.put(("qr_failed", f"识别失败：{type(e).__name__}: {e}"))
 
     # -- 启动下载 --
     def start(self):
@@ -800,6 +820,25 @@ class App:
                     self._cancel_resolve_timer()
                     self.msg("已取消解析。", "warn")
                     self.set_busy(False)
+                elif kind == "qr_ok":
+                    info = ev[1]
+                    self.link.delete(0, "end")
+                    self.link.insert(0, info["url"])
+                    self.passcode.delete(0, "end")
+                    if info.get("passcode"):
+                        self.passcode.insert(0, info["passcode"])
+                    if self._resolving or (self.worker is not None and self.worker.is_alive()):
+                        self.msg("二维码已识别并填入；当前有任务在跑，等它结束再点「解析并开始下载」。", "warn")
+                        continue
+                    if not info.get("passcode"):
+                        # 只有链接：提取码可能是对方单独发的，留给用户补
+                        self.passcode.focus_set()
+                        self.msg("二维码里只有链接；提取码请单独输入。不需要提取码就直接按回车或点「解析并开始下载」。", "warn")
+                        continue
+                    self.msg("二维码识别成功，已填入链接 + 提取码，开始下载。", "ok")
+                    self.start()
+                elif kind == "qr_failed":
+                    self.msg(f"二维码：{ev[1]}", "err")
                 elif kind == "login_ok":
                     cookies, info = ev[1]
                     try:
@@ -848,6 +887,28 @@ class App:
 def main():
     import tkinter as tk
     args = sys.argv[1:]
+    import json
+
+    # 诊断用：不打开界面，识别剪贴板/指定图片里的二维码，结果写到 %LOCALAPPDATA%\UC下载器\qr_test.txt
+    if "--qr-test" in args:
+        i = args.index("--qr-test")
+        image_path = args[i + 1] if i + 1 < len(args) and not args[i + 1].startswith("--") else ""
+        out = {"time": time.strftime("%Y-%m-%d %H:%M:%S")}
+        try:
+            if image_path:
+                from PIL import Image
+                with Image.open(image_path) as im:
+                    text = qr_tools.decode_qr(im.convert("RGB"))
+                info = qr_tools.parse_share_text(text)
+            else:
+                info = qr_tools.read_clipboard_share()
+            out.update(ok=True, **info)
+        except Exception as e:
+            out.update(ok=False, error=f"{type(e).__name__}: {e}")
+        os.makedirs(uc_api.APP_DIR, exist_ok=True)
+        with open(os.path.join(uc_api.APP_DIR, "qr_test.txt"), "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=1)
+        return 0
 
     # 诊断用：不打开界面，直接跑一次分享解析，结果写到 %LOCALAPPDATA%\UC下载器\resolve_test.txt
     if "--resolve-test" in args:
