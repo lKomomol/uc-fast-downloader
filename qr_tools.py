@@ -22,6 +22,21 @@ class QRCodeError(Exception):
     """二维码读取/识别失败，message 直接给用户看"""
 
 
+def clipboard_has_image():
+    """只看剪贴板里有没有图片，不解码；用于 Ctrl+V 判断"""
+    try:
+        from PIL import Image, ImageGrab
+        data = ImageGrab.grabclipboard()
+        if isinstance(data, Image.Image):
+            return True
+        if isinstance(data, (list, tuple)):
+            return any(isinstance(item, str) and item.lower().endswith(_IMAGE_EXTS)
+                       and os.path.isfile(item) for item in data)
+    except Exception:
+        pass
+    return False
+
+
 def _clipboard_image():
     try:
         from PIL import Image, ImageGrab

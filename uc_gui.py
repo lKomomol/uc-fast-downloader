@@ -24,9 +24,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 import uc_api
 import qr_tools
+import task_store
 
 APP_TITLE = "UC 多线程下载器"
 if getattr(sys, "frozen", False):          # PyInstaller 单文件模式：用 exe 所在目录
@@ -220,54 +222,37 @@ class Downloader:
             with self._lock:
                 self.fh.seek(off)
                 self.fh.write(data)
+                self.fh.flush()          # 先让数据落到系统缓存，再记“完成”
                 self.done.add(idx)
                 self.done_bytes += len(data)
                 self._save_state()
 
     # -- 主流程 --
-    def run(self):
-        q = self.q
-        try:
-            self.total = self._head()
-        except urllib.error.HTTPError as e:
-            q.put(("failed", http_hint(e)))
-            return
-        except Exception as e:
-            q.put(("failed", f"获取文件信息失败：{type(e).__name__}: {str(e)[:120]}"))
-            return
+    def _chunk_len(self, i):
+        return max(0, min(self.chunk, self.total - i * self.chunk))
 
+    def _zero_chunks(self, indices=None):
+        """返回内容全为 0 的分块编号；没有内容/读不到也算可疑"""
         nchunks = (self.total + self.chunk - 1) // self.chunk
-        q.put(("log", f"文件大小 {self.total/1048576:.1f} MB，分 {nchunks} 块（{self.chunk//1048576} MB/块），{min(self.conns, nchunks)} 线程", "ok"))
+        if indices is None:
+            indices = range(nchunks)
+        bad = []
+        try:
+            with open(self.out_path, "rb") as f:
+                for i in indices:
+                    if i < 0 or i >= nchunks:
+                        continue
+                    f.seek(i * self.chunk)
+                    b = f.read(self._chunk_len(i))
+                    if not b or not any(b):
+                        bad.append(i)
+        except Exception:
+            return list(indices)
+        return bad
 
-        resume = False
-        if os.path.exists(self.state_path):
-            try:
-                st = json.load(open(self.state_path, encoding="utf-8"))
-                if st.get("total") == self.total and st.get("chunk") == self.chunk:
-                    self.done = set(st.get("done", []))
-                    resume = bool(self.done)
-                    if resume:
-                        self.done_bytes = sum(
-                            min(self.chunk, self.total - i * self.chunk) for i in self.done
-                        )
-                        self.recv_bytes = self.done_bytes
-                        q.put(("log", f"发现上次未完成的进度：已完成 {len(self.done)}/{nchunks} 块，继续续传", "warn"))
-            except Exception:
-                pass
-
-        os.makedirs(os.path.dirname(self.out_path) or ".", exist_ok=True)
-        self.fh = open(self.out_path, "r+b" if resume else "wb")
-        self.fh.truncate(self.total)
-
-        self.pending = [i for i in range(nchunks) if i not in self.done]
-        if not self.pending:
-            self.fh.close()
-            q.put(("progress", self._progress(0.0, 0.0)))
-            q.put(("done", {"path": self.out_path, "total": self.total, "seconds": 0.0, "resumed": True}))
-            return
-
-        t0 = time.time()
-        last = [t0, self.recv_bytes]
+    def _run_workers(self, t0):
+        q = self.q
+        last = [time.time(), self.recv_bytes]
         ths = [threading.Thread(target=self._worker, daemon=True)
                for _ in range(min(self.conns, len(self.pending)))]
         for t in ths:
@@ -291,33 +276,121 @@ class Downloader:
         for t in ths:
             t.join(timeout=3)
         self._save_state()
-        elapsed = time.time() - t0
+
+    def run(self):
+        q = self.q
+        try:
+            self.total = self._head()
+        except urllib.error.HTTPError as e:
+            q.put(("failed", http_hint(e), "error"))
+            return
+        except Exception as e:
+            q.put(("failed", f"获取文件信息失败：{type(e).__name__}: {str(e)[:120]}", "error"))
+            return
+
+        nchunks = (self.total + self.chunk - 1) // self.chunk
+        q.put(("log", f"文件大小 {self.total/1048576:.1f} MB，分 {nchunks} 块（{self.chunk//1048576} MB/块），{min(self.conns, nchunks)} 线程", "ok"))
+
+        resume = False
+        if os.path.exists(self.state_path):
+            try:
+                st = json.load(open(self.state_path, encoding="utf-8"))
+                if st.get("total") == self.total and st.get("chunk") == self.chunk:
+                    self.done = {i for i in st.get("done", [])
+                                 if isinstance(i, int) and 0 <= i < nchunks}
+                    resume = bool(self.done)
+                    if resume:
+                        self.done_bytes = sum(self._chunk_len(i) for i in self.done)
+                        self.recv_bytes = self.done_bytes
+                        q.put(("log", f"发现上次未完成的进度：已完成 {len(self.done)}/{nchunks} 块，继续续传", "warn"))
+            except Exception:
+                pass
+
+        os.makedirs(os.path.dirname(self.out_path) or ".", exist_ok=True)
+        self.fh = open(self.out_path, "r+b" if resume else "wb")
+        self.fh.truncate(self.total)
+
+        # 旧进度里的“完成块”不一定真的写进去了：先检查一遍全零块，避免续传出一个空洞文件
+        if self.done:
+            bad_done = self._zero_chunks(sorted(self.done))
+            if bad_done:
+                self.done.difference_update(bad_done)
+                self.done_bytes = sum(self._chunk_len(i) for i in self.done)
+                self.recv_bytes = self.done_bytes
+                q.put(("log", f"发现 {len(bad_done)} 个上次标记完成但内容为空的块，自动重下", "warn"))
+                self._save_state()
+
+        self.pending = [i for i in range(nchunks) if i not in self.done]
+        if not self.pending:
+            self.fh.close()
+            q.put(("progress", self._progress(0.0, 0.0)))
+            q.put(("done", {"path": self.out_path, "total": self.total, "seconds": 0.0,
+                            "resumed": True, "zeros": 0}))
+            return
+
+        t0 = time.time()
+        self._run_workers(t0)
 
         if self.fatal:
             self.fh.close()
-            q.put(("failed", self.fatal))
+            q.put(("failed", self.fatal, "error"))
             return
         if self.pending:
             self.fh.close()
-            q.put(("failed", f"还有 {len(self.pending)} 块没下完（已停止）。已保存进度，重新粘贴新链接可续传。"))
+            kind = "stopped" if self.stop.is_set() else "error"
+            q.put(("failed", f"还有 {len(self.pending)} 块没下完（已停止）。已保存进度，点「继续」可续传。", kind))
             return
 
+        # 下完后再扫一次全零块；如果发现空洞，自动重下一轮（最多一次）
+        zero_bad = []
+        for attempt in range(2):
+            self.fh.flush()
+            zero_bad = self._zero_chunks()
+            if not zero_bad:
+                break
+            if attempt >= 1 or self.stop.is_set() or self.fatal:
+                break
+            q.put(("log", f"发现 {len(zero_bad)} 个全零块，自动重下这些块…", "warn"))
+            with self._lock:
+                for i in zero_bad:
+                    self.done.discard(i)
+                self.pending = sorted(zero_bad)
+                self.done_bytes = sum(self._chunk_len(i) for i in self.done)
+                self.recv_bytes = self.done_bytes
+                self._save_state()
+            self._run_workers(t0)
+            if self.fatal or self.pending:
+                break
+
+        if self.fatal:
+            self.fh.close()
+            q.put(("failed", self.fatal, "error"))
+            return
+        if self.pending:
+            self.fh.close()
+            kind = "stopped" if self.stop.is_set() else "error"
+            q.put(("failed", f"还有 {len(self.pending)} 块没下完（已停止）。已保存进度，点「继续」可续传。", kind))
+            return
+        if zero_bad:
+            self.fh.close()
+            q.put(("failed", f"重下后仍有 {len(zero_bad)} 个全零块，文件可能不完整；点「重新下载」再试一次。", "corrupt"))
+            return
+
+        elapsed = time.time() - t0
         self.fh.flush()
         self.fh.close()
         size = os.path.getsize(self.out_path)
         if size != self.total:
-            q.put(("failed", f"大小校验不一致：磁盘 {size} / 预期 {self.total}"))
+            q.put(("failed", f"大小校验不一致：磁盘 {size} / 预期 {self.total}", "error"))
             return
         q.put(("log", "大小校验通过，正在检查是否有空洞…", "info"))
-        zeros = self._scan_zeros()
-        q.put(("log", f"空洞检查：全零块 {zeros} 个" + ("（正常）" if zeros == 0 else "（可能有缺失数据，建议重下）"),
-               "ok" if zeros == 0 else "warn"))
+        q.put(("log", "空洞检查：全零块 0 个（正常）", "ok"))
         if os.path.exists(self.state_path):
             os.remove(self.state_path)
         self.recv_bytes = self.total
         q.put(("progress", self._progress(0.0, self.total / max(elapsed, 1e-6) / 1048576.0, 0.0)))
         q.put(("done", {"path": self.out_path, "total": self.total, "seconds": elapsed,
-                        "resumed": resume, "zeros": zeros}))
+                        "resumed": resume, "zeros": 0}))
 
     def _progress(self, inst, avg, left=0.0):
         return {"done": min(self.recv_bytes, self.total or 0), "total": self.total or 0,
@@ -353,57 +426,116 @@ def _short(text, n=76):
 
 
 class TaskQueue:
-    """给每个任务套一层队列，下载线程只要往这里丢事件，界面按任务分发"""
+    """给每个任务套一层队列；带 epoch，旧线程的迟到事件会被界面丢掉"""
 
-    def __init__(self, app_q, task_id):
+    def __init__(self, app_q, task_id, epoch):
         self.app_q = app_q
         self.task_id = task_id
+        self.epoch = epoch
 
     def put(self, event):
-        self.app_q.put(("task", self.task_id, event))
+        self.app_q.put(("task", self.task_id, self.epoch, event))
 
 
 class DownloadTask:
-    _next_id = 0
-
-    def __init__(self, app, link, pwd_id, passcode):
-        DownloadTask._next_id += 1
-        self.id = f"task-{DownloadTask._next_id}"
+    def __init__(self, app, link, pwd_id, passcode, record=None):
         self.app = app
-        self.link = link
-        self.pwd_id = pwd_id
-        self.code = passcode
-        self.passcode = passcode
-        self.title = f"分享 {pwd_id}"
-        self.out_dir = app.current_out_dir()
-        self.out_path = None
-        self.conns = app.selected_conns()
-        self.chunk = app.selected_chunk()
         self.parsed = None
+        self.worker = None
+        self.row = None
+        self.name_lbl = None
+        self.pb = None
+        self.status_lbl = None
+        self.btn_restart = None
+        self.btn_pause = None
+        self.btn_open = None
+        self.btn_del = None
+        self.restart_pending = False
+        self.cleanup_running = False
+        self._last_persist = 0.0
 
-        self.status = "resolving"       # resolving / downloading / pausing / paused / done / failed / needs_code
+        if record:
+            self.id = str(record.get("id") or f"task-{uuid.uuid4().hex[:10]}")
+            self.link = record.get("link") or link
+            self.pwd_id = record.get("pwd_id") or pwd_id
+            self.code = passcode or app.task_store.decrypt_code(record.get("passcode_enc") or "")
+            self.title = record.get("title") or f"分享 {self.pwd_id}"
+            self.out_dir = record.get("out_dir") or app.current_out_dir()
+            self.out_path = record.get("out_path") or None
+            try:
+                self.conns = max(1, int(record.get("conns") or app.selected_conns()))
+            except Exception:
+                self.conns = app.selected_conns()
+            try:
+                self.chunk = max(1, int(record.get("chunk") or app.selected_chunk()))
+            except Exception:
+                self.chunk = app.selected_chunk()
+            status = record.get("status") or "paused"
+            if status in ("resolving", "downloading", "pausing"):
+                status = "paused"
+            self.status = status
+            self.done = int(record.get("done") or 0)
+            self.total = int(record.get("total") or 0)
+            self.error = record.get("error") or ""
+            self.created_at = record.get("created_at") or time.strftime("%Y-%m-%d %H:%M:%S")
+            self.completed_at = record.get("completed_at") or ""
+            self.trashed = bool(record.get("trashed"))
+            self.trashed_at = record.get("trashed_at") or ""
+        else:
+            self.id = f"task-{uuid.uuid4().hex[:10]}"
+            self.link = link
+            self.pwd_id = pwd_id
+            self.code = passcode
+            self.title = f"分享 {pwd_id}"
+            self.out_dir = app.current_out_dir()
+            self.out_path = None
+            self.conns = app.selected_conns()
+            self.chunk = app.selected_chunk()
+            self.status = "resolving"
+            self.done = 0
+            self.total = 0
+            self.error = ""
+            self.created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+            self.completed_at = ""
+            self.trashed = False
+            self.trashed_at = ""
+
+        self.passcode = self.code
         self.pause_requested = False
-        self.error = ""
         self.stop_event = threading.Event()
         self.cancel_resolve = threading.Event()
-        self.worker = None
-
-        self.done = 0
-        self.total = 0
         self.inst = 0.0
         self.avg = 0.0
         self.left = 0.0
         self.chunks_done = 0
         self.chunks_total = 0
         self.started_at = time.time()
+        self.epoch = 0
+        self.q = TaskQueue(app.q, self.id, 0)
 
-        self.q = TaskQueue(app.q, self.id)
-        self.row = None
-        self.name_lbl = None
-        self.pb = None
-        self.status_lbl = None
-        self.btn_pause = None
-        self.btn_del = None
+    def to_record(self):
+        return {
+            "id": self.id,
+            "link": self.link,
+            "pwd_id": self.pwd_id,
+            "passcode_enc": self.app.task_store.encrypt_code(self.code) if self.code else "",
+            "title": self.title,
+            "out_dir": self.out_dir,
+            "out_path": self.out_path,
+            "conns": self.conns,
+            "chunk": self.chunk,
+            "status": self.status,
+            "done": int(self.done or 0),
+            "total": int(self.total or 0),
+            "created_at": self.created_at,
+            "completed_at": self.completed_at,
+            "trashed": bool(getattr(self, "trashed", False)),
+            "trashed_at": getattr(self, "trashed_at", ""),
+            "error": self.error,
+        }
+
+    def persist(self):
+        self.app.persist_task(self)
 
     # -- 行界面 --
     def build_row(self, parent):
@@ -418,18 +550,31 @@ class DownloadTask:
             font=("Microsoft YaHei UI", 9, "bold"))
         self.name_lbl.grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=(5, 0))
 
-        self.btn_pause = self.app.tk.Button(
-            row, text="⏸", width=3, command=lambda: self.app.toggle_pause(self),
-            relief="groove", borderwidth=1, bg="#f5f5f5", activebackground="#e8e8e8",
-            font=("Segoe UI Symbol", 11))
-        self.btn_pause.grid(row=0, column=1, rowspan=3, sticky="ns", padx=(2, 0), pady=5)
+        btnbox = self.app.tk.Frame(row, bg="#ffffff")
+        btnbox.grid(row=0, column=1, rowspan=3, sticky="nsew", padx=(4, 6), pady=4)
+        for c in range(2):
+            btnbox.columnconfigure(c, weight=1)
+        for r in range(2):
+            btnbox.rowconfigure(r, weight=1)
 
-        self.btn_del = self.app.tk.Button(
-            row, text="✕", width=3, command=lambda: self.app.remove_task(self),
-            relief="groove", borderwidth=1, bg="#f5f5f5", fg="#c5221f",
-            activebackground="#ffe8e6", activeforeground="#c5221f",
-            font=("Segoe UI Symbol", 10))
-        self.btn_del.grid(row=0, column=2, rowspan=3, sticky="ns", padx=(2, 6), pady=5)
+        def action(text, command, fg="black", font=("Segoe UI Symbol", 10), bg="#f5f5f5"):
+            b = self.app.tk.Button(btnbox, text=text, width=3, height=1, command=command,
+                                   relief="groove", borderwidth=1, bg=bg, fg=fg,
+                                   activebackground="#e8e8e8", activeforeground=fg,
+                                   padx=0, pady=0, font=font)
+            return b
+
+        self.btn_restart = action("↻", lambda: self.app.restart_button(self))
+        self.btn_restart.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        self.btn_open = action("📁", lambda: self.app.open_task_folder(self),
+                               font=("Segoe UI Emoji", 10))
+        self.btn_open.grid(row=0, column=1, sticky="nsew", padx=1, pady=1)
+        self.btn_pause = action("⏸", lambda: self.app.pause_button(self))
+        self.btn_pause.grid(row=1, column=0, sticky="nsew", padx=1, pady=1)
+        self.btn_del = action("✕", lambda: self.app.delete_button(self), fg="#c5221f",
+                              bg="#f5f5f5")
+        self.btn_del.configure(activebackground="#ffe8e6", activeforeground="#c5221f")
+        self.btn_del.grid(row=1, column=1, sticky="nsew", padx=1, pady=1)
 
         self.pb = self.app.ttk.Progressbar(row, maximum=100.0, mode="determinate")
         self.pb.grid(row=1, column=0, sticky="ew", padx=(8, 4), pady=(4, 2))
@@ -450,6 +595,36 @@ class DownloadTask:
         self.pb.configure(value=pct)
         self.name_lbl.configure(text=_short(self.title))
 
+        if getattr(self, "trashed", False):
+            try:
+                self.pb.grid_remove()       # 回收站只留任务信息，不显示进度条
+            except Exception:
+                pass
+            cleaning = getattr(self, "cleanup_running", False)
+            if cleaning:
+                text = "回收站 · 正在清理未完成文件…"
+                color = "#b06000"
+            elif self.status == "done":
+                text = "回收站 · 已完成（文件保留）"
+                color = "#777777"
+            elif self.status == "paused":
+                text = "回收站 · 已暂停"
+                color = "#777777"
+            else:
+                text = "回收站 · " + (self.error or self.status)
+                color = "#777777"
+            self.status_lbl.configure(text=text, fg=color)
+            self.btn_pause.configure(text="↩", state="disabled" if cleaning else "normal")
+            self.btn_restart.configure(text="↻", state="disabled" if cleaning else "normal")
+            self.btn_open.configure(state="normal")
+            self.btn_del.configure(state="normal")
+            self.app.refresh_title()
+            return
+
+        try:
+            self.pb.grid()
+        except Exception:
+            pass
         if self.status == "resolving":
             text = "解析中…"
             color = "#555555"
@@ -488,17 +663,23 @@ class DownloadTask:
             self.btn_pause.configure(text="✓", state="disabled")
         else:
             self.btn_pause.configure(text="▶", state="normal")
+        self.btn_restart.configure(state="disabled" if self.status == "pausing" else "normal")
+        self.btn_open.configure(state="normal")
+        self.btn_del.configure(state="normal")
 
         self.app.refresh_title()
 
     # -- 解析 --
     def start_resolve(self):
         self.pause_requested = False
+        self.epoch += 1
+        self.q = TaskQueue(self.app.q, self.id, self.epoch)
         self.cancel_resolve = threading.Event()
         self.stop_event = threading.Event()
         self.status = "resolving"
         self.error = ""
         self.update_row()
+        self.persist()
         self.worker = threading.Thread(target=self._resolve_worker, daemon=True)
         self.worker.start()
 
@@ -527,6 +708,7 @@ class DownloadTask:
         self.status = "downloading"
         self.started_at = time.time()
         self.update_row()
+        self.persist()
         mode = parsed.get("mode")
         mode_text = "登录态（单连接约 500KB/s）" if mode == "login" else (
             "游客态（单连接约 100KB/s）" if mode == "guest" else "未知")
@@ -539,8 +721,11 @@ class DownloadTask:
         self.status = "downloading"
         self.pause_requested = False
         self.error = ""
+        self.epoch += 1
+        self.q = TaskQueue(self.app.q, self.id, self.epoch)
         self.stop_event = threading.Event()
         self.update_row()
+        self.persist()
         self.worker = threading.Thread(target=self._download_worker, args=(parsed,), daemon=True)
         self.worker.start()
 
@@ -559,6 +744,7 @@ class DownloadTask:
         self.stop_event.set()
         self.status = "pausing"
         self.update_row()
+        self.persist()
         self.app.msg(f"[{self.title}] 正在暂停，进度会保存…", "warn")
 
     def resume(self):
@@ -569,12 +755,60 @@ class DownloadTask:
         self.start_resolve()
 
     def mark_paused(self):
+        if self.restart_pending:
+            self._really_restart()
+            return
         if self.status == "paused":
             return
         self.status = "paused"
         self.pause_requested = False
         self.update_row()
+        self.persist()
         self.app.msg(f"[{self.title}] 已暂停，进度已保存；点 ▶ 继续，不用重新粘链接。", "warn")
+
+    def restart(self):
+        """重新下载：停掉当前任务、清掉旧进度，用同一链接从头再来"""
+        if self.restart_pending:
+            return
+        if self.status in ("resolving", "downloading", "pausing"):
+            self.restart_pending = True
+            self.pause_requested = True
+            self.cancel_resolve.set()
+            self.stop_event.set()
+            if self.status != "pausing":
+                self.status = "pausing"
+                self.update_row()
+            self.app.msg(f"[{self.title}] 准备重新下载…", "warn")
+            return
+        self._really_restart()
+
+    def _really_restart(self):
+        self.restart_pending = False
+        self.pause_requested = False
+        self.cancel_resolve = threading.Event()
+        self.stop_event = threading.Event()
+        self.done = 0
+        self.total = 0
+        self.inst = 0.0
+        self.avg = 0.0
+        self.left = 0.0
+        self.chunks_done = 0
+        self.chunks_total = 0
+        self.completed_at = ""
+        self.error = ""
+        if self.out_path:
+            try:
+                os.remove(self.out_path + ".parts.json")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                self.app.msg(f"[{self.title}] 删除旧进度失败：{e}", "warn")
+        self.status = "resolving"
+        self.update_row()
+        self.persist()
+        self.app.move_task_tab(self)
+        self.app.msg(f"[{self.title}] 重新下载：清掉旧进度，从头开始。", "warn")
+        self.start_resolve()
 
     def on_progress(self, p):
         self.done = p.get("done") or 0
@@ -585,29 +819,49 @@ class DownloadTask:
         self.chunks_done = p.get("chunks_done") or 0
         self.chunks_total = p.get("chunks_total") or 0
         self.update_row()
+        now = time.time()
+        if now - self._last_persist >= 2.0:
+            self._last_persist = now
+            self.persist()
 
     def on_done(self, info):
+        if self.restart_pending:
+            self._really_restart()
+            return
+        paused_race = self.pause_requested
         self.status = "done"
         self.done = info.get("total") or self.total
         self.total = self.done
+        self.completed_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.inst = 0.0
         self.left = 0.0
         self.update_row()
+        self.persist()
+        self.app.move_task_tab(self)
         secs = info.get("seconds") or 0.0
         speed = (self.total / secs / 1048576.0) if secs else 0.0
         self.app.msg(f"[{self.title}] 下载完成：{info.get('path')}（{self.total / 1048576:.1f} MB，{speed:.1f} MB/s）", "ok")
+        if paused_race:
+            self.app.msg(f"[{self.title}] 暂停没来得及生效，文件已经下完了。", "warn")
 
-    def on_failed(self, msg):
-        if self.pause_requested:
+    def on_failed(self, msg, kind=None):
+        if self.restart_pending:
+            self._really_restart()
+            return
+        if self.pause_requested and kind in (None, "stopped") and "没下完" in str(msg):
             self.mark_paused()
             return
         self.status = "failed"
         self.error = str(msg)
         self.update_row()
+        self.persist()
         self.app.msg(f"[{self.title}] 下载失败：{self.error}", "err")
 
     def on_resolve_failed(self, payload):
         msg, code = payload if isinstance(payload, (tuple, list)) else (str(payload), None)
+        if self.restart_pending:
+            self._really_restart()
+            return
         if self.pause_requested:
             self.mark_paused()
             return
@@ -615,14 +869,20 @@ class DownloadTask:
             self.status = "needs_code"
             self.error = str(msg)
             self.update_row()
+            self.persist()
             self.app.ask_passcode(self, str(msg), code in uc_api.BAD_PASSCODE)
             return
         self.status = "failed"
         self.error = str(msg)
         self.update_row()
+        self.persist()
         self.app.msg(f"[{self.title}] 解析失败：{self.error}", "err")
 
-    def handle_event(self, ev):
+    def handle_event(self, ev, epoch=None):
+        if epoch is not None and epoch != self.epoch:
+            return
+        if getattr(self, "trashed", False):
+            return
         kind = ev[0]
         if kind == "log":
             self.app.msg(f"[{self.title}] {ev[1]}", ev[2] if len(ev) > 2 else "info")
@@ -637,11 +897,11 @@ class DownloadTask:
         elif kind == "done":
             self.on_done(ev[1])
         elif kind == "failed":
-            self.on_failed(ev[1])
+            self.on_failed(ev[1], ev[2] if len(ev) > 2 else None)
 
 
 class App:
-    def __init__(self, root, out_dir=None):
+    def __init__(self, root, out_dir=None, tasks_path=None):
         import tkinter as tk
         from tkinter import filedialog, font as tkfont, ttk
 
@@ -651,6 +911,7 @@ class App:
         self.root = root
         self.q = queue.Queue()
         self.tasks = {}
+        self.task_store = task_store.TaskStore(tasks_path) if tasks_path else task_store.TaskStore()
         self.store = uc_api.CookieStore()
         self.login_info = self.store.info()
         self.default_out_dir = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -731,28 +992,28 @@ class App:
         head = ttk.Frame(root)
         head.pack(fill="x", padx=10, pady=(6, 0))
         ttk.Label(head, text="③ 下载列表").pack(side="left")
-        ttk.Label(head, text="可以连续添加多个任务；⏸ 暂停 / ▶ 继续 / ✕ 移除（文件保留）",
+        ttk.Label(head, text="↻ 重下 / ⏸ 暂停 / 📁 文件夹 / ✕ 移到回收站；回收站可 ↩ 恢复",
                   foreground="#777777", font=("Microsoft YaHei UI", 8)).pack(side="left", padx=8)
 
-        list_frame = ttk.Frame(root)
-        list_frame.pack(fill="x", padx=10, pady=(2, 4))
-        self.task_canvas = tk.Canvas(list_frame, height=240, highlightthickness=0, bg="#fbfbfb")
-        self.task_scroll = ttk.Scrollbar(list_frame, command=self.task_canvas.yview)
-        self.task_inner = tk.Frame(self.task_canvas, bg="#fbfbfb")
-        self._task_window = self.task_canvas.create_window((0, 0), window=self.task_inner, anchor="nw")
-        self.task_inner.bind("<Configure>",
-                             lambda e: self.task_canvas.configure(scrollregion=self.task_canvas.bbox("all")))
-        self.task_canvas.bind("<Configure>",
-                              lambda e: self.task_canvas.itemconfigure(self._task_window, width=e.width))
-        self.task_canvas.configure(yscrollcommand=self.task_scroll.set)
-        self.task_canvas.pack(side="left", fill="both", expand=True)
-        self.task_scroll.pack(side="right", fill="y")
-        self.task_canvas.bind("<Enter>", lambda e: self.task_canvas.bind_all("<MouseWheel>", self._on_wheel))
-        self.task_canvas.bind("<Leave>", lambda e: self.task_canvas.unbind_all("<MouseWheel>"))
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="x", padx=10, pady=(2, 4))
+        self.active_tab = ttk.Frame(self.notebook)
+        self.completed_tab = ttk.Frame(self.notebook)
+        self.trash_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.active_tab, text="进行中 (0)")
+        self.notebook.add(self.completed_tab, text="已完成 (0)")
+        self.notebook.add(self.trash_tab, text="回收站 (0)")
 
-        self.empty_lbl = tk.Label(self.task_inner, text="还没有任务：粘分享链接或二维码，点「解析并开始下载」",
-                                  bg="#fbfbfb", fg="#888888", font=("Microsoft YaHei UI", 9))
-        self.empty_lbl.pack(pady=40)
+        (self.active_canvas, self.active_inner,
+         self.active_empty) = self._make_task_tab(
+            self.active_tab, "还没有进行中的任务：粘分享链接或二维码，点「解析并开始下载」")
+        (self.completed_canvas, self.completed_inner,
+         self.completed_empty) = self._make_task_tab(
+            self.completed_tab, "还没有完成的任务")
+        (self.trash_canvas, self.trash_inner,
+         self.trash_empty) = self._make_task_tab(
+            self.trash_tab, "回收站是空的")
+        self.notebook.select(self.active_tab)
 
         # ④ 日志
         ttk.Label(root, text="④ 日志：").pack(anchor="w", **pad)
@@ -768,13 +1029,16 @@ class App:
             self.log.tag_configure(k, foreground=c)
 
         if self.login_info:
-            self.msg("准备就绪：已保存登录态。粘分享链接/二维码即可，支持一次加多个任务。", "ok")
+            self.msg("准备就绪：已保存登录态。粘分享链接/二维码即可，支持 Ctrl+V 快捷粘贴、一次加多个任务。", "ok")
         else:
-            self.msg("准备就绪：粘分享链接/二维码即可，支持一次加多个任务。想快 5 倍，点右上「登录」登一次。", "info")
+            self.msg("准备就绪：粘分享链接/二维码即可，支持 Ctrl+V 快捷粘贴、一次加多个任务。想快 5 倍，点右上「登录」登一次。", "info")
+        self.restore_tasks()
 
         self.icon_loaded = self._load_icon()
         self._poll_id = self.root.after(400, self.poll)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind_all("<Control-KeyPress-v>", self.on_ctrl_v)
+        self.root.bind_all("<Control-KeyPress-V>", self.on_ctrl_v)
 
         # 剪贴板里已经是分享链接就自动填入
         try:
@@ -787,23 +1051,34 @@ class App:
 
     # -- 界面小工具 --
     def _load_icon(self):
-        """设置窗口与任务栏图标；打包后从 _MEIPASS 读，开发时从脚本目录读"""
+        """设置窗口与任务栏图标；打包后从 _MEIPASS 读，开发时从 icon/ 读"""
         base = getattr(sys, "_MEIPASS", HERE)
-        ico = os.path.join(base, "uc_icon.ico")
-        png = os.path.join(base, "uc_icon.png")
-        if os.path.exists(ico):
-            try:
-                self.root.iconbitmap(default=ico)
-                return True
-            except Exception:
-                pass
-        if os.path.exists(png):
-            try:
-                self._icon_img = self.tk.PhotoImage(file=png)   # 必须持引用，否则被回收
-                self.root.iconphoto(True, self._icon_img)
-                return True
-            except Exception:
-                pass
+        ico_candidates = [
+            os.path.join(base, "uc_icon.ico"),
+            os.path.join(base, "icon", "uc_icon.ico"),
+            os.path.join(HERE, "icon", "uc_icon.ico"),
+            os.path.join(HERE, "UC下载器.ico"),
+        ]
+        for ico in ico_candidates:
+            if os.path.exists(ico):
+                try:
+                    self.root.iconbitmap(default=ico)
+                    return True
+                except Exception:
+                    pass
+        png_candidates = [
+            os.path.join(base, "uc_icon.png"),
+            os.path.join(base, "icon", "uc_icon.png"),
+            os.path.join(HERE, "icon", "uc_icon.png"),
+        ]
+        for png in png_candidates:
+            if os.path.exists(png):
+                try:
+                    self._icon_img = self.tk.PhotoImage(file=png)   # 必须持引用，否则被回收
+                    self.root.iconphoto(True, self._icon_img)
+                    return True
+                except Exception:
+                    pass
         return False
 
     def msg(self, text, kind="info"):
@@ -861,6 +1136,17 @@ class App:
         except Exception as e:
             self.msg(f"打不开文件夹：{e}", "warn")
 
+    def open_task_folder(self, task):
+        try:
+            target = os.path.dirname(task.out_path) if task.out_path else task.out_dir
+            if task.out_path and os.path.isfile(task.out_path):
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(task.out_path)])
+            else:
+                os.makedirs(target, exist_ok=True)
+                os.startfile(os.path.normpath(target))
+        except Exception as e:
+            self.msg(f"打不开文件夹：{e}", "warn")
+
     def on_close(self):
         """关窗：置停止标志，让下载线程尽量保存进度"""
         self._closing = True
@@ -868,6 +1154,10 @@ class App:
             try:
                 task.cancel_resolve.set()
                 task.stop_event.set()
+                if task.status in ("resolving", "downloading", "pausing"):
+                    task.status = "paused"
+                    task.pause_requested = False
+                self.persist_task(task)
             except Exception:
                 pass
         try:
@@ -962,18 +1252,100 @@ class App:
             candidate = os.path.join(task.out_dir, f"{base} ({n}){ext}")
         return candidate
 
-    def add_task(self, task):
-        task.build_row(self.task_inner)
+    def _make_task_tab(self, parent, empty_text):
+        frame = self.ttk.Frame(parent)
+        frame.pack(fill="both", expand=True)
+        canvas = self.tk.Canvas(frame, height=240, highlightthickness=0, bg="#fbfbfb")
+        scroll = self.ttk.Scrollbar(frame, command=canvas.yview)
+        inner = self.tk.Frame(canvas, bg="#fbfbfb")
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(window, width=e.width))
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        canvas.bind("<Enter>", lambda e, c=canvas: c.bind_all(
+            "<MouseWheel>", lambda ev: self._on_wheel(c, ev)))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        empty = self.tk.Label(inner, text=empty_text, bg="#fbfbfb", fg="#888888",
+                              font=("Microsoft YaHei UI", 9))
+        empty.pack(pady=40)
+        return canvas, inner, empty
+
+    def _task_parent(self, task):
+        if getattr(task, "trashed", False):
+            return self.trash_inner
+        return self.completed_inner if task.status == "done" else self.active_inner
+
+    def add_task(self, task, persist=True):
+        task.build_row(self._task_parent(task))
         self.tasks[task.id] = task
-        try:
-            self.empty_lbl.pack_forget()
-        except Exception:
-            pass
+        self.update_tab_titles()
         self._refresh_scroll()
-        self.msg(f"已加入下载列表：{task.pwd_id}，开始解析…", "info")
+        if persist:
+            self.persist_task(task)
+            self.msg(f"已加入下载列表：{task.pwd_id}，开始解析…", "info")
 
     def remove_task(self, task):
+        # 兼容旧调用：主列表的 ✕ 现在是“移到回收站”
+        self.trash_task(task)
+
+    def trash_task(self, task):
+        if task.id not in self.tasks or getattr(task, "trashed", False):
+            return
+        was_done = task.status == "done"
+        task.trashed = True
+        task.trashed_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        task.epoch += 1
+        task.pause_requested = False
+        task.restart_pending = False
+        try:
+            task.cancel_resolve.set()
+            task.stop_event.set()
+        except Exception:
+            pass
+        if not was_done and task.status in ("resolving", "downloading", "pausing"):
+            task.status = "paused"
+        task.cleanup_running = not was_done
+        task.update_row()
+        self.move_task_tab(task)
+        self.persist_task(task)
+        if was_done:
+            self.msg(f"已移到回收站：{task.title}（已完成，文件保留；可点 ↩ 恢复）", "warn")
+        else:
+            self.msg(f"已移到回收站：{task.title}，正在清理未完成文件…（可点 ↩ 恢复）", "warn")
+            threading.Thread(target=self._delete_unfinished_files, args=(task,), daemon=True).start()
+
+    def restore_task(self, task, redownload=False):
+        if task.id not in self.tasks or not getattr(task, "trashed", False):
+            return
+        if getattr(task, "cleanup_running", False):
+            self.msg(f"[{task.title}] 还在清理未完成文件，稍等一下再点恢复。", "warn")
+            return
+        task.trashed = False
+        task.trashed_at = ""
+        if task.status == "done" and not redownload:
+            self.move_task_tab(task)
+            self.persist_task(task)
+            self.msg(f"[{task.title}] 已从回收站恢复到「已完成」。", "ok")
+            return
+        task.status = "paused"
+        task.pause_requested = False
+        self.move_task_tab(task)
+        self.persist_task(task)
+        if redownload:
+            self.msg(f"[{task.title}] 已从回收站恢复，开始重新下载…", "warn")
+            task.restart()
+        else:
+            self.msg(f"[{task.title}] 已从回收站恢复，点 ▶ 继续。", "ok")
+
+    def delete_task_forever(self, task):
         if task.id not in self.tasks:
+            return
+        if not getattr(task, "trashed", False):
+            self.trash_task(task)
             return
         try:
             task.cancel_resolve.set()
@@ -986,13 +1358,151 @@ class App:
                 task.row.destroy()
         except Exception:
             pass
-        if not self.tasks:
-            try:
-                self.empty_lbl.pack(pady=40)
-            except Exception:
-                pass
+        self.task_store.remove(task.id)
+        self.update_tab_titles()
         self._refresh_scroll()
-        self.msg(f"已移除任务：{task.title}（已下载的文件保留）", "warn")
+        self.msg("记录已删除", "warn")
+
+    def _delete_unfinished_files(self, task):
+        """未完成任务进回收站时，连同 .parts.json 和半成品文件一起清掉"""
+        try:
+            if task.worker is not None and task.worker.is_alive():
+                task.worker.join(timeout=10)
+        except Exception:
+            pass
+        if not getattr(task, "trashed", False):
+            task.cleanup_running = False
+            self.q.put(("cleanup_done", task.id))
+            return
+        targets = []
+        if task.out_path:
+            targets = [task.out_path + ".parts.json", task.out_path]
+        removed = []
+        failed = []
+        for path in targets:
+            if not path or not os.path.exists(path):
+                continue
+            ok = False
+            for _ in range(6):
+                try:
+                    os.remove(path)
+                    ok = True
+                    break
+                except FileNotFoundError:
+                    ok = True
+                    break
+                except Exception:
+                    time.sleep(0.25)
+            if ok:
+                removed.append(path)
+            else:
+                failed.append(path)
+        if removed:
+            self.q.put(("log", f"[{task.title}] 已删除未完成文件：{os.path.basename(task.out_path or '')}", "warn"))
+        if failed:
+            self.q.put(("log", f"[{task.title}] 临时文件删除失败，请手动清理：{failed[0]}", "err"))
+        task.cleanup_running = False
+        self.q.put(("cleanup_done", task.id))
+
+    def move_task_tab(self, task):
+        if task.id not in self.tasks:
+            return
+        try:
+            if task.row is not None:
+                task.row.destroy()
+        except Exception:
+            pass
+        task.row = None
+        task.build_row(self._task_parent(task))
+        if task.status == "done" and not getattr(task, "trashed", False):
+            self._sort_completed()
+        self.update_tab_titles()
+        self._refresh_scroll()
+
+    def _sort_completed(self):
+        rows = [t for t in self.tasks.values()
+                if t.status == "done" and not getattr(t, "trashed", False) and t.row is not None]
+        rows.sort(key=lambda t: t.completed_at or "", reverse=True)
+        for t in rows:
+            t.row.pack_forget()
+        for t in rows:
+            t.row.pack(fill="x", padx=2, pady=2)
+
+    def update_tab_titles(self):
+        active = sum(1 for t in self.tasks.values()
+                     if not getattr(t, "trashed", False) and t.status != "done")
+        done = sum(1 for t in self.tasks.values()
+                   if not getattr(t, "trashed", False) and t.status == "done")
+        trash = sum(1 for t in self.tasks.values() if getattr(t, "trashed", False))
+        try:
+            self.notebook.tab(0, text=f"进行中 ({active})")
+            self.notebook.tab(1, text=f"已完成 ({done})")
+            self.notebook.tab(2, text=f"回收站 ({trash})")
+        except Exception:
+            pass
+        try:
+            if active:
+                self.active_empty.pack_forget()
+            else:
+                self.active_empty.pack(pady=40)
+            if done:
+                self.completed_empty.pack_forget()
+            else:
+                self.completed_empty.pack(pady=40)
+            if trash:
+                self.trash_empty.pack_forget()
+            else:
+                self.trash_empty.pack(pady=40)
+        except Exception:
+            pass
+
+    def pause_button(self, task):
+        if getattr(task, "trashed", False):
+            self.restore_task(task)
+        else:
+            self.toggle_pause(task)
+
+    def restart_button(self, task):
+        if getattr(task, "trashed", False):
+            self.restore_task(task, redownload=True)
+        else:
+            task.restart()
+
+    def delete_button(self, task):
+        if getattr(task, "trashed", False):
+            self.delete_task_forever(task)
+        else:
+            self.trash_task(task)
+
+    def persist_task(self, task):
+        try:
+            if not self.task_store.upsert(task.to_record()):
+                self.msg(f"[{task.title}] 任务记录保存失败。", "warn")
+        except Exception as e:
+            self.msg(f"[{task.title}] 任务记录保存失败：{e}", "warn")
+
+    def restore_tasks(self):
+        records = self.task_store.records()
+        if not records:
+            return
+        records.sort(key=lambda r: (r.get("created_at") or "", r.get("id") or ""))
+        restored = 0
+        for rec in records:
+            link = rec.get("link") or ""
+            if not link:
+                continue
+            try:
+                task = DownloadTask(self, link, rec.get("pwd_id") or "", "", record=rec)
+            except Exception as e:
+                self.msg(f"恢复任务失败：{e}", "warn")
+                continue
+            self.add_task(task, persist=False)
+            restored += 1
+        if restored:
+            self._sort_completed()
+            self.update_tab_titles()
+            self._refresh_scroll()
+            self.msg(f"恢复了 {restored} 个任务；上次在下载的已置为暂停，点 ▶ 继续。", "warn")
 
     def toggle_pause(self, task):
         if task.status in ("resolving", "downloading"):
@@ -1001,15 +1511,19 @@ class App:
             task.resume()
 
     def _refresh_scroll(self):
-        try:
-            self.task_inner.update_idletasks()
-            self.task_canvas.configure(scrollregion=self.task_canvas.bbox("all"))
-        except Exception:
-            pass
+        for canvas, inner in ((getattr(self, "active_canvas", None), getattr(self, "active_inner", None)),
+                              (getattr(self, "completed_canvas", None), getattr(self, "completed_inner", None)),
+                              (getattr(self, "trash_canvas", None), getattr(self, "trash_inner", None))):
+            try:
+                if canvas is not None and inner is not None:
+                    inner.update_idletasks()
+                    canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
 
-    def _on_wheel(self, event):
+    def _on_wheel(self, canvas, event):
         try:
-            self.task_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         except Exception:
             pass
 
@@ -1051,6 +1565,34 @@ class App:
         self.passcode.delete(0, "end")
         task.start_resolve()
 
+    def on_ctrl_v(self, event=None):
+        """Ctrl+V：剪贴板是二维码图片就直接解析；是 UC 分享链接就填入并开始"""
+        if self._closing:
+            return None
+        try:
+            if qr_tools.clipboard_has_image():
+                self.paste_qr()
+                return "break"
+            text = self.root.clipboard_get().strip()
+        except Exception:
+            return None
+        if text and (uc_api.looks_like_share(text) or uc_api.extract_share_url(text)):
+            try:
+                _pwd_id, code = uc_api.parse_share(text)
+                url = uc_api.extract_share_url(text) or text
+            except Exception as e:
+                self.msg(f"Ctrl+V 识别分享链接失败：{e}", "err")
+                return "break"
+            self.link.delete(0, "end")
+            self.link.insert(0, url)
+            self.passcode.delete(0, "end")
+            if code:
+                self.passcode.insert(0, code)
+            self.msg("Ctrl+V：剪贴板里是 UC 分享链接，已填入并开始。", "ok")
+            self.start()
+            return "break"
+        return None
+
     def paste_qr(self):
         """从剪贴板读二维码，识别后填入链接/提取码并开始"""
         if self._closing:
@@ -1081,6 +1623,7 @@ class App:
                 task.status = "failed"
                 task.error = "未输入提取码"
                 task.update_row()
+                task.persist()
                 self.msg(f"[{task.title}] 未输入提取码；任务留在列表里，点 ▶ 可以重试。", "warn")
                 return
             code = code.strip()
@@ -1102,10 +1645,10 @@ class App:
                 ev = self.q.get_nowait()
                 kind = ev[0]
                 if kind == "task":
-                    _, task_id, inner = ev
+                    _, task_id, epoch, inner = ev
                     task = self.tasks.get(task_id)
                     if task is not None:
-                        task.handle_event(inner)
+                        task.handle_event(inner, epoch)
                 elif kind == "log":
                     self.msg(ev[1], ev[2] if len(ev) > 2 else "info")
                 elif kind == "qr_ok":
@@ -1119,6 +1662,10 @@ class App:
                     else:
                         self.msg("二维码里只有链接，先直接开始；如果 UC 提示需要提取码，会弹窗让你输入。", "warn")
                     self.start()
+                elif kind == "cleanup_done":
+                    task = self.tasks.get(ev[1])
+                    if task is not None:
+                        task.update_row()
                 elif kind == "qr_failed":
                     self.msg(f"二维码：{ev[1]}", "err")
                 elif kind == "login_ok":
