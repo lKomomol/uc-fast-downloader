@@ -4,11 +4,11 @@
 
 用法:
     python uc_gui.py                # 打开界面
-    python uc_gui.py --selftest     # 自检：自动跑一小段下载并退出
+    python uc_gui.py --link "分享链接" [--passcode 1234] [--go]
 
 使用方式：
-    在 UC 网页点下载后，按 F12 -> Network -> 右键那条请求 -> Copy as cURL (bash)，
-    把整段内容粘进窗口，点「解析并开始下载」。
+    粘分享链接（有提取码就填上），点「解析并开始下载」。
+    想快 5 倍可以点「登录」，用手机号+验证码登一次。
 """
 
 import json
@@ -24,6 +24,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import uc_api
 
 APP_TITLE = "UC 多线程下载器"
 if getattr(sys, "frozen", False):          # PyInstaller 单文件模式：用 exe 所在目录
@@ -44,66 +46,6 @@ DEFAULT_HEADERS = {
     ),
 }
 DEFAULT_REFERER = "https://fast.uc.cn/"
-
-
-# ---------------------------------------------------------------- cURL 解析
-
-def _normalize(text):
-    """去掉 bash/cmd 的续行符，压成一行"""
-    t = text.replace("\r\n", "\n").replace("\r", "\n")
-    t = re.sub(r"\\\s*\n", " ", t)          # bash: \ <换行>
-    t = re.sub(r"\^\s*\n", " ", t)          # cmd:  ^ <换行>
-    t = re.sub(r"\s+", " ", t)
-    return t.strip()
-
-
-def _score_url(u):
-    s = 0
-    if "Signature=" in u or "callback-var=" in u:
-        s += 4
-    if "OSSAccessKeyId=" in u:
-        s += 2
-    if "pds.uc.cn" in u or "/dl-" in u:
-        s += 2
-    if u.endswith(".mp4") or "response-content-disposition" in u:
-        s += 1
-    return s
-
-
-def parse_curl(text):
-    """从 Copy as cURL 的文本里抽出 url / cookie / referer / ua"""
-    t = _normalize(text)
-
-    url = None
-    m = re.search(r"--url\s+(['\"])(.*?)\1", t)
-    if m:
-        url = m.group(2)
-    if not url:
-        cands = [c[1] for c in re.findall(r"(['\"])(https?://[^'\"]+?)\1", t)]
-        cands = [c for c in cands if "//" in c]
-        if cands:
-            url = max(cands, key=_score_url)
-    if not url:
-        m = re.search(r"(https?://\S+)", t)
-        if m:
-            url = m.group(1).strip("'\"")
-    if not url:
-        raise ValueError("没找到下载链接（http/https）")
-
-    headers = {}
-    for _, name, value in re.findall(r"(?:-H|--header)\s+(['\"])([^:]+):\s*(.*?)\1", t):
-        headers[name.strip().lower()] = value.strip()
-
-    cookie = headers.get("cookie")
-    if not cookie:
-        m = re.search(r"(?:-b|--cookie)\s+(['\"])(.*?)\1", t)
-        if m:
-            cookie = m.group(2)
-
-    referer = headers.get("referer") or DEFAULT_REFERER
-    ua = headers.get("user-agent") or DEFAULT_HEADERS["User-Agent"]
-
-    return {"url": url, "cookie": cookie or "", "referer": referer, "ua": ua}
 
 
 def filename_from_url(url):
@@ -153,10 +95,10 @@ def http_hint(err):
         pass
     if "require login" in body or "auth not found" in body:
         return ("403：UC 登录校验没通过（Cookie 缺失或已失效）。\n"
-                "     请回网页重新点下载 → F12 → Network → 右键该请求 → Copy as cURL，再粘进来。")
+                "     请重新点「开始」让程序再取一次直链；如果仍失败，点「清除」后重新登录。")
     if "SignatureDoesNotMatch" in body or code == 403:
         return ("403：直链已过期或被拒绝（直链有效期约 3 小时）。\n"
-                "     请回网页重新点下载，重新 Copy as cURL 粘贴，可继续断点续传。")
+                "     请重新点「开始」让程序再取一次直链；已下载的进度会保留，可继续续传。")
     return f"HTTP {code}: {body[:200]}"
 
 
@@ -403,7 +345,7 @@ LOG_COLORS = {"info": "#222222", "ok": "#137333", "warn": "#b06000", "err": "#c5
 
 
 class App:
-    def __init__(self, root, out_dir=None, selftest=False):
+    def __init__(self, root, out_dir=None):
         import tkinter as tk
         from tkinter import filedialog, font as tkfont, ttk
 
@@ -415,13 +357,26 @@ class App:
         self.stop_event = threading.Event()
         self.worker = None
         self.dl = None
-        self.selftest = selftest
-        self.out_dir = out_dir or os.path.join(os.path.expanduser("~"), "Downloads")
+        self._resolving = False
+        self._resolve_gen = 0
+        self._resolve_timer = None
+        self._resolve_cancel = threading.Event()
+        self.default_out_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        saved_dir = uc_api.load_settings().get("out_dir")
+        if out_dir:
+            self.out_dir = out_dir
+        elif isinstance(saved_dir, str) and saved_dir.strip():
+            self.out_dir = os.path.expanduser(saved_dir)
+        else:
+            self.out_dir = self.default_out_dir
+        self.out_dir = os.path.normpath(self.out_dir)
         self.out_path = None
+        self.store = uc_api.CookieStore()
+        self.login_info = self.store.info()
 
         root.title(APP_TITLE)
-        root.geometry("760x580")
-        root.minsize(680, 520)
+        root.geometry("780x600")
+        root.minsize(700, 540)
         try:
             tkfont.nametofont("TkDefaultFont").configure(family="Microsoft YaHei UI", size=10)
             tkfont.nametofont("TkTextFont").configure(family="Microsoft YaHei UI", size=10)
@@ -430,37 +385,60 @@ class App:
 
         pad = {"padx": 10, "pady": 4}
 
-        # ① 粘贴区
-        ttk.Label(root, text="① 粘贴 Copy as cURL 的整段内容：").pack(anchor="w", **pad)
-        box = ttk.Frame(root)
-        box.pack(fill="both", expand=True, padx=10)
-        self.text = tk.Text(box, height=7, wrap="word", undo=True,
-                            font=("Consolas", 9), relief="solid", borderwidth=1)
-        sb = ttk.Scrollbar(box, command=self.text.yview)
-        self.text.configure(yscrollcommand=sb.set)
-        self.text.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        # ① 分享链接（推荐）
+        linkbar = ttk.Frame(root)
+        linkbar.pack(fill="x", **pad)
+        ttk.Label(linkbar, text="① 分享链接").pack(side="left")
+        self.link = ttk.Entry(linkbar, font=("Consolas", 9))
+        self.link.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Label(linkbar, text="提取码(可空)").pack(side="left")
+        self.passcode = ttk.Entry(linkbar, width=8)
+        self.passcode.pack(side="left", padx=(2, 8))
+        self.btn_login = tk.Button(linkbar, text="登录（手机号/验证码）", command=self.login,
+                                   relief="groove", borderwidth=1, padx=8, pady=2,
+                                   font=("Microsoft YaHei UI", 9))
+        self.btn_login.pack(side="left")
+        self.btn_logout = ttk.Button(linkbar, text="清除", width=6, command=self.logout)
+        self.btn_logout.pack(side="left", padx=(4, 0))
+
+        for w in (self.link, self.passcode):
+            w.bind("<Return>", lambda e: self.start())
+
+        self.lbl_login = ttk.Label(root, text=self._login_status_text(), foreground="#555555")
+        self.lbl_login.pack(anchor="w", padx=10)
+        self._update_login_ui()
 
         # 按钮行
         bar = ttk.Frame(root)
         bar.pack(fill="x", **pad)
-        self.btn_paste = ttk.Button(bar, text="从剪贴板粘贴", command=self.paste_clipboard)
         self.btn_start = ttk.Button(bar, text="解析并开始下载", command=self.start)
         self.btn_stop = ttk.Button(bar, text="停止", command=self.stop, state="disabled")
         self.btn_open = ttk.Button(bar, text="打开所在文件夹", command=self.open_folder)
-        for w in (self.btn_paste, self.btn_start, self.btn_stop, self.btn_open):
+        for w in (self.btn_start, self.btn_stop, self.btn_open):
             w.pack(side="left", padx=3)
         ttk.Label(bar, text="连接数").pack(side="left", padx=(14, 2))
-        self.conns = ttk.Combobox(bar, width=4, values=("16", "32", "48", "64", "96"), state="readonly")
-        self.conns.set("64")
+        self.conns = ttk.Combobox(bar, width=4, values=("16", "32", "48", "64", "96", "128", "192"),
+                                  state="readonly")
         self.conns.pack(side="left")
         ttk.Label(bar, text="分块").pack(side="left", padx=(10, 2))
-        self.chunk = ttk.Combobox(bar, width=6, values=("2 MB", "4 MB", "8 MB"), state="readonly")
-        self.chunk.set("4 MB")
+        self.chunk = ttk.Combobox(bar, width=6, values=("1 MB", "2 MB", "4 MB", "8 MB"), state="readonly")
         self.chunk.pack(side="left")
+        self.apply_defaults()
 
-        # ② 进度条
-        ttk.Label(root, text="② 进度：").pack(anchor="w", **pad)
+        # ③ 保存位置
+        savebar = ttk.Frame(root)
+        savebar.pack(fill="x", padx=10, pady=(0, 2))
+        ttk.Label(savebar, text="② 保存到").pack(side="left")
+        self.out_dir_var = tk.StringVar(value=self.out_dir)
+        self.dir_entry = ttk.Entry(savebar, textvariable=self.out_dir_var, font=("Consolas", 9))
+        self.dir_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self.btn_browse = ttk.Button(savebar, text="浏览…", command=self.choose_dir)
+        self.btn_browse.pack(side="left")
+        self.btn_default = ttk.Button(savebar, text="默认", width=6, command=self.reset_dir)
+        self.btn_default.pack(side="left", padx=(4, 0))
+
+        # ④ 进度条
+        ttk.Label(root, text="③ 进度：").pack(anchor="w", **pad)
         self.pb = ttk.Progressbar(root, maximum=100.0, mode="determinate")
         self.pb.pack(fill="x", padx=10)
         self.lbl_size = ttk.Label(root, text="0.0 / 0.0 MB          瞬时 0.00 MB/s     均速 0.00 MB/s",
@@ -469,9 +447,6 @@ class App:
         self.lbl_chunk = ttk.Label(root, text="已完成 0/0 块          预计剩余 -- 秒",
                                    font=("Consolas", 10))
         self.lbl_chunk.pack(anchor="w", padx=10)
-        self.lbl_path = ttk.Label(root, text=f"保存到：{self.out_dir}", foreground="#555555")
-        self.lbl_path.pack(anchor="w", padx=10, pady=(6, 2))
-
         # ④ 日志区
         ttk.Label(root, text="④ 日志：").pack(anchor="w", **pad)
         lb = ttk.Frame(root)
@@ -485,18 +460,21 @@ class App:
         for k, c in LOG_COLORS.items():
             self.log.tag_configure(k, foreground=c)
 
-        self.msg("准备就绪。在 UC 网页点下载后，按 F12 → Network → 右键那条请求 → Copy as cURL (bash)，把整段粘进来。", "info")
+        if self.login_info:
+            self.msg("准备就绪：已保存登录态，直接粘分享链接就能全速下载。", "ok")
+        else:
+            self.msg("准备就绪：粘分享链接 + 提取码即可。想快 5 倍，点右上「登录」用手机号验证码登一次。", "info")
         self.icon_loaded = self._load_icon()
         self._closing = False
         self._poll_id = self.root.after(400, self.poll)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # 剪贴板里如果已经有 curl 内容，自动填入
+        # 剪贴板里已经是分享链接就自动填入
         try:
-            clip = self.root.clipboard_get()
-            if re.search(r"\bcurl\b", clip, re.I) and "http" in clip:
-                self.text.insert("1.0", clip)
-                self.msg("检测到剪贴板里已有 curl 内容，已自动填入，可直接点「解析并开始下载」。", "ok")
+            clip = self.root.clipboard_get().strip()
+            if uc_api.looks_like_share(clip):
+                self.link.insert(0, clip)
+                self.msg("检测到剪贴板里是分享链接，已自动填入。", "ok")
         except Exception:
             pass
 
@@ -528,33 +506,63 @@ class App:
         self.log.see("end")
         self.log.configure(state="disabled")
 
-    def paste_clipboard(self):
-        try:
-            clip = self.root.clipboard_get()
-        except Exception:
-            self.msg("剪贴板里没有文本内容。", "warn")
-            return
-        if not clip.strip():
-            self.msg("剪贴板是空的。", "warn")
-            return
-        self.text.delete("1.0", "end")
-        self.text.insert("1.0", clip.strip())
-        self.msg("已从剪贴板填入内容。", "ok")
-
     def set_busy(self, busy):
         self.btn_start.configure(state="disabled" if busy else "normal")
-        self.btn_paste.configure(state="disabled" if busy else "normal")
         self.btn_stop.configure(state="normal" if busy else "disabled")
         self.conns.configure(state="disabled" if busy else "readonly")
         self.chunk.configure(state="disabled" if busy else "readonly")
+        for w in (self.link, self.passcode, self.dir_entry):
+            w.configure(state="disabled" if busy else "normal")
+        for w in (self.btn_login, self.btn_logout, self.btn_browse, self.btn_default):
+            w.configure(state="disabled" if busy else "normal")
+
+    def _update_login_ui(self):
+        info = self.login_info or {}
+        self.lbl_login.configure(text=self._login_status_text(),
+                                 foreground="#137333" if info else "#555555")
+        if info:
+            self.btn_login.configure(text="✓ 已登录", bg="#d9f2dd", fg="#137333",
+                                     activebackground="#c6ebce", activeforeground="#137333")
+        else:
+            self.btn_login.configure(text="登录（手机号/验证码）", bg="SystemButtonFace", fg="black",
+                                     activebackground="SystemButtonFace", activeforeground="black")
+
+    def choose_dir(self):
+        try:
+            d = self.filedialog.askdirectory(initialdir=self.out_dir_var.get() or self.default_out_dir,
+                                             title="选择下载保存位置")
+        except Exception as e:
+            self.msg(f"打开目录选择框失败：{e}", "warn")
+            return
+        if d:
+            d = os.path.normpath(d)
+            self.out_dir_var.set(d)
+            self.out_dir = d
+            self._save_out_dir()
+            self.msg(f"保存位置：{d}", "info")
+
+    def reset_dir(self):
+        self.out_dir_var.set(self.default_out_dir)
+        self.out_dir = self.default_out_dir
+        self._save_out_dir()
+        self.msg("已恢复默认保存位置。", "info")
+
+    def _save_out_dir(self):
+        try:
+            conf = uc_api.load_settings()
+            conf["out_dir"] = self.out_dir_var.get().strip()
+            uc_api.save_settings(conf)
+        except Exception:
+            pass
 
     def open_folder(self):
-        target = self.out_path or self.out_dir
         try:
-            if target and os.path.exists(target) and os.path.isfile(target):
-                subprocess.Popen(["explorer", "/select,", os.path.normpath(target)])
+            if self.out_path and os.path.isfile(self.out_path):
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(self.out_path)])
             else:
-                os.startfile(os.path.normpath(os.path.dirname(target) if target else self.out_dir))
+                target = self.out_dir_var.get().strip() or self.default_out_dir
+                os.makedirs(target, exist_ok=True)
+                os.startfile(os.path.normpath(target))
         except Exception as e:
             self.msg(f"打不开文件夹：{e}", "warn")
 
@@ -574,25 +582,150 @@ class App:
             pass
         self.root.destroy()
 
+    # -- 登录态 --
+    def _login_status_text(self):
+        info = self.login_info or {}
+        if info:
+            mt = info.get("member_type") or "已登录"
+            name = {"NORMAL": "普通用户", "VIP": "会员", "MINI_VIP": "迷你会员",
+                    "SUPER_VIP": "超级会员", "Z_VIP": "Z会员"}.get(mt, mt)
+            return f"登录态：{name}（{mt}）· 单连接约 500KB/s · 默认 64 连接 / 4MB 分块"
+        return "登录态：游客 · 单连接约 100KB/s · 默认 128 连接 / 1MB（登录后快约 5 倍）"
+
+    def apply_defaults(self):
+        if self.login_info:
+            self.conns.set("64")
+            self.chunk.set("4 MB")
+        else:
+            self.conns.set("128")
+            self.chunk.set("1 MB")
+
+    def login(self):
+        if self.login_info:
+            self.msg("当前已经是登录状态；要换账号先点「清除」。", "warn")
+            return
+        self.btn_login.configure(state="disabled")
+        self.msg("正在打开登录窗口…（手机号 + 验证码；滑块也在网页里拖）", "info")
+
+        def run():
+            try:
+                cookies, info = uc_api.login_via_browser(
+                    on_status=lambda m: self.q.put(("log", m, "info")))
+                self.q.put(("login_ok", (cookies, info)))
+            except Exception as e:
+                self.q.put(("login_failed", str(e)))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def logout(self):
+        self.store.clear()
+        try:
+            import shutil
+            shutil.rmtree(uc_api.PROFILE_DIR, ignore_errors=True)
+        except Exception:
+            pass
+        self.login_info = None
+        self._update_login_ui()
+        self.apply_defaults()
+        self.msg("已清除登录态，回到游客模式。", "warn")
+
     # -- 启动下载 --
     def start(self):
-        raw = self.text.get("1.0", "end").strip()
-        if not raw:
-            self.msg("请先粘贴 Copy as cURL 的内容（只粘链接不行，UC 需要 Cookie 才能通过登录校验）。", "err")
+        link = self.link.get().strip()
+        if not link:
+            self.msg("先把分享链接粘进「① 分享链接」（有提取码就填上）。", "err")
             return
         try:
-            parsed = parse_curl(raw)
+            pwd_id, pwd = uc_api.parse_share(link)
         except Exception as e:
-            self.msg(f"解析失败：{e}", "err")
+            self.msg(f"链接解析失败：{e}", "err")
             return
-        if not parsed["cookie"]:
-            self.msg("没在内容里找到 Cookie。请务必用 DevTools 的「Copy as cURL」整段复制，只粘链接无法通过 UC 登录校验。", "err")
+        code = self.passcode.get().strip() or pwd
+        if not self.login_info:
+            self.msg("游客模式：单连接约 100KB/s；要点「登录」才能快 5 倍。", "warn")
+        self.stop_event.clear()
+        self._resolving = True
+        self._resolve_gen += 1
+        gen = self._resolve_gen
+        self._resolve_cancel = threading.Event()
+        self.msg(f"正在解析分享 {pwd_id} …", "info")
+        self.set_busy(True)
+        self.pb.configure(value=0.0)
+        try:
+            threading.Thread(target=self._resolve_worker,
+                             args=(pwd_id, code, gen, self._resolve_cancel), daemon=True).start()
+        except Exception as e:
+            self._resolving = False
+            self._resolve_gen += 1
+            self._cancel_resolve_timer()
+            self.set_busy(False)
+            self.msg(f"启动解析线程失败：{type(e).__name__}: {e}", "err")
             return
+        if self._resolve_timer:
+            try:
+                self.root.after_cancel(self._resolve_timer)
+            except Exception:
+                pass
+        self._resolve_timer = self.root.after(45000, self._resolve_timeout)
 
-        name = filename_from_url(parsed["url"])
+    def _resolve_worker(self, pwd_id, code, gen, cancel_event):
+        try:
+            parsed = uc_api.resolve_share(
+                pwd_id, code, self.store.header(),
+                on_step=lambda m: self.q.put(("log", m, "info")),
+                cancel=cancel_event)
+            self.q.put(("resolved", (gen, parsed)))
+        except uc_api.ShareCancelled:
+            self.q.put(("resolve_cancelled", (gen,)))
+        except Exception as e:
+            import traceback
+            try:
+                os.makedirs(uc_api.APP_DIR, exist_ok=True)
+                with open(os.path.join(uc_api.APP_DIR, "error.log"), "a", encoding="utf-8") as f:
+                    f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n" + traceback.format_exc() + "\n")
+            except Exception:
+                pass
+            self.q.put(("resolve_failed", (gen, str(e))))
+
+    def _cancel_resolve_timer(self):
+        if self._resolve_timer:
+            try:
+                self.root.after_cancel(self._resolve_timer)
+            except Exception:
+                pass
+            self._resolve_timer = None
+
+    def _resolve_timeout(self):
+        self._resolve_timer = None
+        if self._resolving:
+            self.msg("解析超过 45 秒，网络可能卡住了；可以点「停止」取消，或检查网络后重试。", "warn")
+
+    def _begin_download(self, parsed):
+        d = self.out_dir_var.get().strip().strip('"')
+        if not d:
+            d = self.default_out_dir
+        d = os.path.expandvars(os.path.expanduser(d))
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception as e:
+            self.msg(f"保存目录不可用：{d}（{e}）", "err")
+            self.set_busy(False)
+            return
+        self.out_dir = os.path.normpath(d)
+        self.out_dir_var.set(self.out_dir)
+        self._save_out_dir()
+        name = parsed.get("filename") or filename_from_url(parsed["url"])
         self.out_path = os.path.join(self.out_dir, name)
-        self.lbl_path.configure(text=f"保存到：{self.out_path}")
-        self.msg(f"链接解析成功，目标文件：{name}", "ok")
+        size = parsed.get("size") or 0
+        extra = f"（{size/1048576:.1f} MB）" if size else ""
+        self.msg(f"目标文件：{name}{extra}", "ok")
+        more = [f for f in (parsed.get("files") or []) if not f.get("dir")]
+        if len(more) > 1:
+            self.msg(f"分享里有 {len(more)} 个文件，这次先下第一个：{name}", "warn")
+        if parsed.get("mode") == "login":
+            self.msg("直链已确认是登录态：单连接约 500KB/s。", "ok")
+        elif parsed.get("mode") == "guest":
+            self.msg("直链是游客态：单连接约 100KB/s；登录后约 5 倍。", "warn")
         if os.path.exists(self.out_path + ".parts.json"):
             self.msg("检测到同名文件的未完成进度，将自动续传。", "warn")
 
@@ -600,7 +733,8 @@ class App:
             chunk_bytes = int(self.chunk.get().split()[0]) * 1024 * 1024
             conns = int(self.conns.get())
         except Exception:
-            chunk_bytes, conns = 4 * 1024 * 1024, 64
+            chunk_bytes = (4 if self.login_info else 1) * 1024 * 1024
+            conns = 64 if self.login_info else 128
 
         self.stop_event.clear()
         self.set_busy(True)
@@ -608,11 +742,23 @@ class App:
         dl = Downloader(parsed, self.out_path, conns, chunk_bytes, self.q, self.stop_event)
         self.dl = dl
         self.worker = threading.Thread(target=dl.run, daemon=True)
-        self.worker.start()
+        try:
+            self.worker.start()
+        except Exception as e:
+            self.msg(f"启动下载线程失败：{type(e).__name__}: {e}", "err")
+            self.set_busy(False)
 
     def stop(self):
-        if self.worker and self.worker.is_alive():
-            self.stop_event.set()
+        self.stop_event.set()
+        if self._resolving:
+            # 解析线程可能卡在网络调用里，先让界面立刻恢复
+            self._resolve_cancel.set()
+            self._resolve_gen += 1
+            self._resolving = False
+            self._cancel_resolve_timer()
+            self.set_busy(False)
+            self.msg("已取消解析。", "warn")
+        elif self.worker and self.worker.is_alive():
             self.msg("正在停止…（已下载的进度会保留，稍后可续传）", "warn")
 
     # -- 事件轮询 --
@@ -629,9 +775,48 @@ class App:
                     self.update_progress(ev[1])
                 elif kind == "done":
                     self.on_done(ev[1])
+                elif kind == "resolved":
+                    gen, parsed = ev[1]
+                    if gen != self._resolve_gen:
+                        continue
+                    self._resolving = False
+                    self._cancel_resolve_timer()
+                    self._begin_download(parsed)
+                elif kind == "resolve_failed":
+                    gen, text = ev[1]
+                    if gen != self._resolve_gen:
+                        continue
+                    self._resolving = False
+                    self._cancel_resolve_timer()
+                    self.msg(text, "err")
+                    if "提取码" in text:
+                        self.passcode.focus_set()
+                    self.set_busy(False)
+                elif kind == "resolve_cancelled":
+                    gen = ev[1][0]
+                    if gen != self._resolve_gen:
+                        continue
+                    self._resolving = False
+                    self._cancel_resolve_timer()
+                    self.msg("已取消解析。", "warn")
+                    self.set_busy(False)
+                elif kind == "login_ok":
+                    cookies, info = ev[1]
+                    try:
+                        self.store.save(cookies, info)
+                    except Exception as e:
+                        self.msg(f"登录成功，但保存登录态失败：{e}", "warn")
+                    self.login_info = info or {"member_type": "已登录"}
+                    self._update_login_ui()
+                    self.apply_defaults()
+                    self.msg("登录成功，已切到高速默认值（64 连接 / 4MB）。", "ok")
+                    self.btn_login.configure(state="normal")
+                elif kind == "login_failed":
+                    self.msg(f"登录没成功：{ev[1]}", "err")
+                    self.btn_login.configure(state="normal")
                 elif kind == "failed":
                     self.msg(ev[1], "err")
-                    self.msg("提示：重新在网页点下载 → Copy as cURL → 粘贴 → 点开始，即可继续断点续传。", "warn")
+                    self.msg("提示：分享链接直接再点一次「开始」即可续传。", "warn")
                     self.set_busy(False)
         except queue.Empty:
             pass
@@ -663,14 +848,49 @@ class App:
 def main():
     import tkinter as tk
     args = sys.argv[1:]
-    selftest = "--selftest" in args
+
+    # 诊断用：不打开界面，直接跑一次分享解析，结果写到 %LOCALAPPDATA%\UC下载器\resolve_test.txt
+    if "--resolve-test" in args:
+        import json
+        import traceback
+        i = args.index("--resolve-test")
+        link = args[i + 1] if i + 1 < len(args) else ""
+        extra_code = args[i + 2] if i + 2 < len(args) and not args[i + 2].startswith("--") else ""
+        out = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "steps": []}
+        try:
+            pwd, code = uc_api.parse_share(link)
+            code = extra_code or code
+            out["pwd_id"] = pwd
+            r = uc_api.resolve_share(pwd, code, uc_api.CookieStore().header(),
+                                     on_step=lambda m: out["steps"].append(m))
+            out.update(ok=True, mode=r["mode"], name=r["filename"], size=r["size"])
+        except Exception as e:
+            out.update(ok=False, error=f"{type(e).__name__}: {e}", tb=traceback.format_exc()[-2000:])
+        os.makedirs(uc_api.APP_DIR, exist_ok=True)
+        with open(os.path.join(uc_api.APP_DIR, "resolve_test.txt"), "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=1)
+        return 0
+
     out_dir = None
+    link_arg = None
+    code_arg = None
+    auto_go = "--go" in args
     for i, a in enumerate(args):
         if a == "--out-dir" and i + 1 < len(args):
             out_dir = args[i + 1]
+        elif a == "--link" and i + 1 < len(args):
+            link_arg = args[i + 1]
+        elif a == "--passcode" and i + 1 < len(args):
+            code_arg = args[i + 1]
     try:
         root = tk.Tk()
-        app = App(root, out_dir=out_dir, selftest=selftest)
+        app = App(root, out_dir=out_dir)
+        if link_arg:
+            app.link.insert(0, link_arg)
+        if code_arg:
+            app.passcode.insert(0, code_arg)
+        if auto_go and link_arg:
+            root.after(600, app.start)
     except Exception:
         # 打包成 exe 后没有控制台，启动崩溃要让人看见原因
         import traceback
@@ -686,73 +906,8 @@ def main():
         except Exception:
             pass
         return 1
-    if selftest:
-        run_selftest(root, app, args)
     root.mainloop()
     return 0
-
-
-def run_selftest(root, app, args):
-    """自检：把 curl_test.txt 填进去，跑几秒，检查进度和标题是否更新，然后清理退出"""
-    import tkinter as tk
-    curl_file = os.path.join(HERE, "curl_test.txt")
-    seconds = 10
-    for i, a in enumerate(args):
-        if a == "--seconds" and i + 1 < len(args):
-            seconds = float(args[i + 1])
-    if not os.path.exists(curl_file):
-        print("SELFTEST: SKIP（没有 curl_test.txt）")
-        root.after(200, root.destroy)
-        return
-    app.text.delete("1.0", "end")
-    app.text.insert("1.0", open(curl_file, encoding="utf-8").read())
-    app.conns.set("16")
-    app.chunk.set("2 MB")
-
-    result = {"title": "", "pct": 0.0, "speed": 0.0, "logs": []}
-
-    def start_it():
-        app.start()
-
-    def check():
-        result["title"] = root.title()
-        result["icon"] = getattr(app, "icon_loaded", False)
-        try:
-            result["pct"] = float(app.pb["value"])
-        except Exception:
-            pass
-        result["speed"] = app.dl.done_bytes if app.dl else 0
-        result["logs"] = app.log.get("1.0", "end").strip().splitlines()
-        app.stop_event.set()
-        root.after(1500, finish)
-
-    def finish():
-        tmp = app.out_path
-        for p in ([tmp, tmp + ".parts.json"] if tmp else []):
-            try:
-                if p and os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
-        ok = result["pct"] > 0 and "MB/s" in result["title"]
-        lines = ["SELFTEST: " + ("PASS" if ok else "FAIL"),
-                 "  进度条值: %.2f%%" % result["pct"],
-                 "  窗口标题: " + result["title"],
-                 "  已下载字节: %d" % result["speed"],
-                 "  窗口图标: %s" % ("已加载" if result.get("icon") else "未加载"),
-                 "  日志尾部:"]
-        lines += ["    " + l for l in result["logs"][-6:]]
-        text = "\n".join(lines)
-        print(text)
-        try:  # --noconsole 打包后没有 stdout，同时落盘一份结果
-            with open(os.path.join(HERE, "selftest_result.txt"), "w", encoding="utf-8") as f:
-                f.write(text + "\n")
-        except Exception:
-            pass
-        root.destroy()
-
-    root.after(500, start_it)
-    root.after(int(seconds * 1000), check)
 
 
 if __name__ == "__main__":

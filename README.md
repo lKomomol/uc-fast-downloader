@@ -1,71 +1,87 @@
 # UC 网盘多线程下载器
 
-把 UC 网页端"按连接限速"的下载变成 **64 线程并行分块下载**。
+把 UC 网页端"按连接限速"的下载变成 **几十条连接并行分块下载**。
+现在**不用 F12、不用 Copy as cURL**：粘分享链接（有提取码就填上），点一下就开始。
 
-实测同一个 1.58 GB 文件：单连接 **0.5 MB/s（约 56 分钟）** → 本工具 **27.8 MB/s（58 秒）**，提速约 55 倍。
+| 模式 | 单连接 | 64 连接实测 |
+|---|---|---|
+| 游客（不登录） | ~100 KB/s | 6～12 MB/s（连接数要开到 128 左右） |
+| 登录（手机号+验证码） | ~500 KB/s | **20～30 MB/s** |
 
-| 连接数 | 4 | 8 | 16 | 32 | 64 | 96 |
-|---|---|---|---|---|---|---|
-| 速度 (MB/s) | 1.9 | 3.8 | 7.5 | 15.0 | **27.8** | 25.8 |
-
-64 是甜点值（96 反而略降，因为已经吃满带宽）。
+登录是可选的：不登录也能下，只是慢约 5 倍。登录一次后工具会把登录态加密存好，以后不用再登。
 
 ---
 
-## 为什么需要 Cookie
+## 更新日志
 
-UC 的下载直链是阿里云 OSS 的签名直链，但额外带了 `callback` / `callback-var` 参数：
-OSS 在返回数据前，会先拿本次请求的信息（host、Range、**Referer、Cookie**、IP、token…）
-回调 `auth-cdn.uc.cn/outer/oss/checkplay` 做鉴权。
+1. 去掉了繁琐的 F12 操作。
+2. 直接粘贴分享链接即可，不用改什么 fast 了，自带了。
+3. 新增了选择下载位置。
+4. 不登录也能下，速度比较慢。
+5. 选择登录会弹出网页登录，自行登录即可，cookie 会保存，下次使用会复用；如果失效会提示。建议还是登录使用，下得快一点。
 
-不带 Cookie 直接请求会得到：
+---
 
-```xml
-<Code>RequestDeniedByCallback</Code>
-<Message>Callback deny this request reason: require login [auth not found]</Message>
+## 它是怎么拿到直链的
+
+UC 分享页背后是三个接口（全程不需要你手填 Cookie）：
+
+```
+POST pc-api.uc.cn/1/clouddrive/share/sharepage/token      {pwd_id, passcode} → stoken
+GET  .../share/sharepage/detail?pwd_id=&stoken=...                           → 文件列表
+POST .../1/clouddrive/file/download  {fids, pwd_id, stoken, fids_token}      → 签名直链
 ```
 
-所以**必须带上你自己 UC 账号的登录态**——这也是本工具唯一需要你提供的东西。
-
-> 顺带一个坑：UC 的回调只放行 `GET`，用 `HEAD` 探测文件大小会被 403 拒绝，
-> 所以代码里用 `Range: bytes=0-0` 的 GET 来拿文件大小。
+- 游客会话就能取到直链，所以**不登录也能用**
+- 直链是阿里云 OSS 的签名地址，但额外带 `callback` 鉴权；OSS 会拿请求里的
+  **Cookie / Referer** 回调 UC 校验
+- 登录态的直链和游客直链长得不一样：解码 `callback-var` 里的 `x:token`，
+  游客是 `...-5-7-100-...`，登录是 `...-2-7-500-...`，正好对应 100 / 500 KB/s 的单连接限速
+- 直链有效期约 3 小时，但工具是**每次现取**，过期了重新点开始即可
 
 ## 为什么并行就能提速
 
-UC 对**每一条连接**单独限速（实测约 0.5 MB/s）。单连接再快也就那样，
-所以把文件切成若干分块、同时开几十条连接各拉一块，聚合速度就上去了。
+UC 对**每一条连接**单独限速。单连接再快也就那样，所以把文件切成若干块、
+同时开几十条 `Range` 连接各拉一块，聚合速度就上去了。
+
+| 连接数（游客） | 64 | 128 | 192 | 256（小块） |
+|---|---|---|---|---|
+| 速度 | 6.2 | 10.4~11 | 12.6 | 7.7 MB/s |
+
+登录态下每连接 500KB/s，64 连接就能吃满大多数家宽；再往上加意义不大。
 
 ---
 
-## 使用方法（三步）
+## 使用方法
 
-1. 在 UC 网页点「下载」，让浏览器先开始下载（只为生成临时直链，可随时取消）
-2. 浏览器按 `F12` → **Network（网络）** 面板 → 找到那条 mp4 请求
-   （名字像一串 40 位十六进制、Type 显示 `document`）
-   → 右键该请求 → **Copy → Copy as cURL (bash)**
-3. 打开本程序，把整段内容粘进输入框 → 点「解析并开始下载」
+1. 直接把分享链接粘进去；如果有提取码，提取码也粘进去。
+2. 不登录也可以下载，速度较慢；登录之后可以更快地下载。
 
-程序会自动从这段 cURL 里解析出 **直链 / Cookie / Referer / UA**，不用你手填任何字段。
-启动时会自动读剪贴板，如果里面已经是 curl 内容会自动填好。
-
-下完点「打开所在文件夹」即可，文件默认保存在 `用户目录\Downloads`。
+- **登录**：点右上角「登录（手机号/验证码）」，在弹出的浏览器窗口里自行登录即可。
+  cookie 会自动保存，下次使用复用；如果失效会提示。建议还是登录使用，下得快一点。
+- **保存位置**：默认是 `用户目录\Downloads`，点「浏览…」可以自己选，选过会记住；点「默认」恢复。
 
 ### 界面里能看到什么
 
-- 进度条百分比
-- `已下载 / 总大小`、**瞬时速度**、**平均速度**
+- 登录状态：游客 / 普通用户 / 会员，以及对应的单连接速度
+- 进度条、`已下载 / 总大小`、瞬时速度、平均速度
 - 已完成分块数 / 总分块数、预计剩余时间
-- 日志区（解析结果、续传提示、错误原因、完成后的校验结果）
+- 日志区：解析结果、直链是游客还是登录态、续传提示、错误原因、完成校验
 - 窗口标题栏同步显示 `62.3% · 27.8 MB/s`
 
 ---
 
-## 两种版本
+## 文件说明
 
 | 文件 | 说明 |
 |---|---|
-| `uc_gui.py` | 图形界面版（tkinter，**只用 Python 标准库**，无第三方依赖） |
+| `uc_gui.py` | 图形界面版（tkinter，标准库） |
+| `uc_api.py` | 分享链接解析、浏览器登录态抓取、Cookie 加密存储 |
 | `download.py` | 命令行版，读同目录的 `url.txt`（直链）和 `cookie.txt`（Cookie 头） |
+
+> `UC下载器.exe` / `UC下载器_old.exe` 是本地打包产物，不随仓库提交；
+> `icon/`、`ref/` 里的图标和参考素材同样不入库（第三方角色形象不在授权范围内）。
+> 自己打包：`pyinstaller --onefile --noconsole uc_gui.py`（不带图标也能正常运行）。
 
 命令行版用法：
 
@@ -75,36 +91,64 @@ python download.py --conns 64 --chunk 4 --out "doro916(1).mp4"
 
 ### 参数
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--conns` | 64 | 并发连接数。跑不满就加；加到 96 没提升说明卡在宽带 |
-| `--chunk` | 4 MB | 分块大小。网络抖动大降到 2 MB（重试代价小），追求快可升 8 MB |
-| `--out` | 自动 | 输出文件名，默认从直链的 `response-content-disposition` 还原 |
+| 参数 | 游客默认 | 登录默认 | 说明 |
+|---|---|---|---|
+| 连接数 | 128 | 64 | 跑不满就加；游客加到 192 左右封顶 |
+| 分块 | 1 MB | 4 MB | 网络抖动大降到 1~2 MB；追求快可升 8 MB |
+
+分块越大，单块耗时长；中途停止时"还没收完的块"会丢弃，所以别把分块设得过于夸张。
 
 ---
 
 ## 断点续传
 
 - 进度记录在同名文件的 `.parts.json` 里，**每完成一块就原子写入一次**
-- 中途关窗 / 停止 / 崩溃，下次粘贴**新直链**即可接着下（直链只有 3 小时有效期，过期必须重新获取）
-- 分块是**收完才写盘**，所以最坏情况只是重下几个分块，不会出现半个分块被当成完成
+- 中途关窗 / 停止 / 崩溃，下次**重新粘分享链接**点开始即可接着下
+- 分块是**收完才写盘**，最坏情况只是重下几个分块，不会出现半个分块被当成完成
 - 下载完成后自动校验：文件大小一致 + 全零块扫描（检查有没有空洞）
+
+## 登录态存在哪
+
+- `%LOCALAPPDATA%\UC下载器\login.dat`，用 Windows **DPAPI** 加密（只有当前 Windows 用户能解）
+- 只保存 `uc.cn` 域的 Cookie，不写日志、不上传、不入 git
+- 「清除」会删掉登录态文件和独立的浏览器配置目录
 
 ---
 
 ## 常见问题
 
-**报 `403 require login [auth not found]`**
-没按要求用 Copy as cURL（只粘了链接），或 Cookie 已失效。按三步重来。
+**提示「这个分享需要提取码」/「提取码不对」**
+把提取码填进「提取码(可空)」再点开始。提取码不区分大小写。
 
-**报 `403 直链已过期`**
-直链有效期约 3 小时。回网页重新点下载 → 重新 Copy → 粘贴，程序会自动发现上次进度继续续传。
+**登录窗口没弹出来 / 打不开**
+需要本机有 Chrome 或 Edge。程序会优先用 Chrome，其次 Edge。
+如果窗口被其他窗口挡住，看任务栏。
+
+**登录了还是显示游客 / 速度没变**
+看日志里那句「直链是游客态」还是「登录态」。如果是游客态：
+点「清除」→ 重新「登录」一次（Cookie 可能过期或被风控了）。
+
+**解析一直不动 / 卡在「正在解析」**
+日志会显示当前步骤（取分享令牌 / 读文件列表 / 取直链）。点「停止」会立刻取消解析，
+不会卡住界面。如果反复失败，可以跑一次诊断：
+
+```bash
+UC下载器.exe --resolve-test "https://drive.uc.cn/s/xxxxxxxx" 1234
+```
+
+结果在 `%LOCALAPPDATA%\UC下载器\resolve_test.txt`（含每一步和报错），
+异常堆栈还会追加到同目录的 `error.log`。
+
+**报 `403 require login [auth not found]`**
+直链过期或登录态失效。分享链接模式直接再点一次开始（会重新取直链）；
+现在是分享链接模式，再点一次「开始」即可。
 
 **进度条开头几秒不动 / 增幅偏小**
-正常。速度按"已接收字节"实时统计，开头建连时偏低，稳定后会拉起来。
+正常。速度按"已接收字节"统计，开头建连时偏低，稳定后会拉起来。
 
 **杀毒软件报警 / 提示未知发布者**
-这类单文件小工具常被误报，添加信任即可。不放心可以直接跑源码 `python uc_gui.py`（只用标准库，无第三方依赖）。
+这类单文件小工具常被误报，添加信任即可。不放心可以直接跑源码
+`python uc_gui.py`（分享下载和登录抓取都只用标准库；登录时会调用你本机的 Chrome/Edge）。
 
 **闪退且没有界面**
 同目录会生成 `crash.log`，看里面的报错即可定位。
@@ -114,9 +158,10 @@ python download.py --conns 64 --chunk 4 --out "doro916(1).mp4"
 ## 免责声明
 
 - 本工具**只是把你本来就有权访问的文件用多条连接并发下载**，不破解任何付费/权限限制
+- 登录态只用于向你自己的 UC 账号请求文件本身，不会上传到任何地方
 - 请遵守你所在地区的法律法规以及 UC/阿里云的服务条款，仅用于个人合理使用
-- 请勿传播他人的 Cookie；**Cookie 等同于账号登录态**，拿到就能进对应账号
-- 若 UC 调整回调鉴权或限速策略，本工具会失效，需要跟着更新
+- 请勿传播他人的 Cookie；**Cookie 等同于账号登录态**
+- 若 UC 调整分享接口或回调鉴权，本工具会失效，需要跟着更新
 
 ## License
 
@@ -126,10 +171,11 @@ python download.py --conns 64 --chunk 4 --out "doro916(1).mp4"
 
 ## English
 
-Multi-threaded downloader for UC (uc.cn) share links. The official web download is throttled
-**per connection** (~0.5 MB/s), so this tool splits the file into chunks and pulls them over
-dozens of parallel `Range` requests — measured 1.58 GB in 58 s (27.8 MB/s).
+Multi-threaded downloader for UC (uc.cn) share links. Paste a share link (plus passcode
+if any) and the tool resolves the signed OSS URL through UC's share API, then downloads
+the file over dozens of parallel `Range` requests.
 
-UC's signed OSS URLs are gated by a callback that requires your **logged-in cookies**, so paste
-a "Copy as cURL" from DevTools and the GUI parses URL/cookie/referer automatically.
-Supports resume, retry, and post-download verification. Python 3 + tkinter only.
+Anonymous sessions work but are capped at ~100 KB/s per connection; an optional
+phone + SMS login (performed in a clean Chrome/Edge window, cookies captured and
+DPAPI-encrypted locally) raises it to ~500 KB/s per connection — about 5× faster.
+Python 3 + tkinter; share download and login capture use only the standard library.
