@@ -3,6 +3,8 @@
 把 UC 网页端"按连接限速"的下载变成 **几十条连接并行分块下载**。
 现在**不用 F12、不用 Copy as cURL**：粘分享链接（有提取码就填上），点一下就开始。
 
+> **直接下载（Windows 10/11 x64，免安装）**：见 [Releases](https://github.com/lKomomol/uc-fast-downloader/releases/latest)。
+
 | 模式 | 单连接 | 64 连接实测 |
 |---|---|---|
 | 游客（不登录） | ~100 KB/s | 6～12 MB/s（连接数要开到 128 左右） |
