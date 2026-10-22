@@ -4,7 +4,8 @@
 
 对外主要接口：
     parse_share(text)                 -> (pwd_id, passcode)
-    resolve_share(pwd_id, passcode, cookie_header="") -> dict
+    list_share_tree(pwd_id, passcode, cookie_header="") -> dict
+    resolve_share(pwd_id, passcode, cookie_header="", target=None) -> dict
     login_via_browser(on_status=None) -> (cookies, info)
     CookieStore()                     -> 本地加密保存/读取登录态
 """
@@ -48,6 +49,9 @@ BROWSERS = [
 ]
 
 FILE_NOT_FOUND = (41006,)
+SHARE_PAGE_SIZE = 100
+MAX_FOLDER_DEPTH = 8
+MAX_FOLDER_FILES = 2000
 NEED_PASSCODE = (41008,)
 BAD_PASSCODE = (41007,)
 NEED_LOGIN = (31001, 401)
@@ -221,7 +225,19 @@ def _speed_mode(url):
 # 流程：token -> detail -> file/download
 # token 接口不需要登录；带登录 Cookie 时拿到的直链单连接约 500KB/s，游客约 100KB/s
 
-def resolve_share(pwd_id, passcode="", cookie_header="", on_step=None, cancel=None):
+def list_share_tree(pwd_id, passcode="", cookie_header="", on_step=None, cancel=None,
+                    max_depth=MAX_FOLDER_DEPTH, max_files=MAX_FOLDER_FILES):
+    """递归列出分享里的所有文件（支持文件夹分享）。
+
+    返回:
+      {
+        "title": 分享标题,
+        "files": [{fid, name, size, fid_token, rel_dir, rel_path}],
+        "folder_count": N,
+        "has_folders": bool,
+        "truncated": bool,
+      }
+    """
     def step(msg):
         if on_step:
             try:
@@ -252,23 +268,172 @@ def resolve_share(pwd_id, passcode="", cookie_header="", on_step=None, cancel=No
     if not stoken:
         raise ShareError(tok.get("message") or "取不到分享令牌", code)
 
-    p = {
-        "pwd_id": pwd_id, "stoken": stoken, "pdir_fid": "0", "force": "0",
-        "_page": "1", "_size": "100", "_fetch_banner": "1", "_fetch_share": "1",
-        "_fetch_total": "1", "_sort": "file_type:asc,updated_at:desc",
-    }
-    step("读取文件列表…")
-    detail = _api(opener, "/1/clouddrive/share/sharepage/detail", params=p)
-    check()
-    if detail.get("code") not in (0, None):
-        raise ShareError(detail.get("message") or "读取分享列表失败", detail.get("code"))
-    data = detail.get("data") or {}
-    items = data.get("list") or []
-    files = [x for x in items if not x.get("dir")]
-    if not files:
-        raise ShareError("这个分享里没有可下载的文件（文件夹分享暂不支持）")
+    share = (tok.get("data") or {}).get("share") or {}
+    files = []
+    folder_count = 0
+    has_folders = False
+    truncated = False
+    seen_dirs = set()
+    seen_files = set()
 
-    f = files[0]
+    def walk(fid, rel_parts, depth):
+        nonlocal folder_count, has_folders, truncated
+        if truncated:
+            return
+        if depth > max_depth:
+            truncated = True
+            return
+        if fid in seen_dirs:
+            return
+        seen_dirs.add(fid)
+        page = 1
+        while True:
+            check()
+            params = {
+                "pwd_id": pwd_id, "stoken": stoken, "pdir_fid": fid, "force": "0",
+                "_page": str(page), "_size": str(SHARE_PAGE_SIZE),
+                "_fetch_banner": "1", "_fetch_share": "1", "_fetch_total": "1",
+                "_sort": "file_type:asc,updated_at:desc",
+            }
+            detail = _api(opener, "/1/clouddrive/share/sharepage/detail", params=params)
+            check()
+            if detail.get("code") not in (0, None):
+                raise ShareError(detail.get("message") or "读取分享列表失败", detail.get("code"))
+            data = detail.get("data") or {}
+            items = data.get("list") or []
+            for item in items:
+                name = sanitize(item.get("file_name") or "未命名")
+                if item.get("dir"):
+                    has_folders = True
+                    folder_count += 1
+                    if depth < max_depth:
+                        walk(item.get("fid"), rel_parts + [name], depth + 1)
+                    else:
+                        truncated = True
+                else:
+                    if item.get("fid") in seen_files:
+                        continue
+                    seen_files.add(item.get("fid"))
+                    rel_dir = "/".join(rel_parts)
+                    rel_path = "/".join(rel_parts + [name])
+                    files.append({
+                        "fid": item.get("fid"),
+                        "name": name,
+                        "size": int(item.get("size") or 0),
+                        "fid_token": item.get("share_fid_token") or "",
+                        "parent_fid": fid,
+                        "rel_dir": rel_dir,
+                        "rel_path": rel_path,
+                    })
+                    if len(files) >= max_files:
+                        truncated = True
+                        return
+            if len(items) < SHARE_PAGE_SIZE:
+                break
+            page += 1
+            if page > 1000:
+                truncated = True
+                break
+
+    step("读取分享目录…")
+    walk("0", [], 0)
+    if not files:
+        raise ShareError("这个分享里没有可下载的文件（文件夹可能是空的）")
+    if truncated:
+        step(f"文件较多，只读取了前 {len(files)} 个")
+    step(f"文件夹扫描完成：{len(files)} 个文件")
+    return {
+        "title": share.get("title") or pwd_id,
+        "files": files,
+        "folder_count": folder_count,
+        "has_folders": has_folders,
+        "truncated": truncated,
+    }
+
+
+def resolve_share(pwd_id, passcode="", cookie_header="", on_step=None, cancel=None, target=None):
+    def step(msg):
+        if on_step:
+            try:
+                on_step(msg)
+            except Exception:
+                pass
+
+    def check():
+        if cancel is not None and cancel.is_set():
+            raise ShareCancelled("已取消解析")
+
+    jar = _seed_jar(cookie_header)
+    opener = _opener(jar)
+
+    check()
+    step("取分享令牌…")
+    tok = _api(opener, "/1/clouddrive/share/sharepage/token", "POST",
+               {"pwd_id": pwd_id, "passcode": passcode or ""})
+    check()
+    code = tok.get("code")
+    if code in NEED_PASSCODE:
+        raise ShareError("这个分享需要提取码，请在「提取码」里填上", code)
+    if code in BAD_PASSCODE:
+        raise ShareError("提取码不对，改一下再试", code)
+    if code in FILE_NOT_FOUND:
+        raise ShareError("分享不存在或已经失效", code)
+    stoken = (tok.get("data") or {}).get("stoken")
+    if not stoken:
+        raise ShareError(tok.get("message") or "取不到分享令牌", code)
+
+    if target and target.get("fid"):
+        # 文件夹里的指定文件：用同一个 stoken 回到它所在目录，重新取最新的 share_fid_token。
+        # 旧 token 可能和上一轮 stoken 绑定，直接复用会报 token 校验异常。
+        parent_fid = target.get("parent_fid") or "0"
+        f = None
+        page = 1
+        while f is None:
+            check()
+            p = {
+                "pwd_id": pwd_id, "stoken": stoken, "pdir_fid": parent_fid, "force": "0",
+                "_page": str(page), "_size": str(SHARE_PAGE_SIZE), "_fetch_banner": "1",
+                "_fetch_share": "1", "_fetch_total": "1",
+                "_sort": "file_type:asc,updated_at:desc",
+            }
+            detail = _api(opener, "/1/clouddrive/share/sharepage/detail", params=p)
+            check()
+            if detail.get("code") not in (0, None):
+                raise ShareError(detail.get("message") or "读取文件所在目录失败", detail.get("code"))
+            items = (detail.get("data") or {}).get("list") or []
+            for item in items:
+                if item.get("fid") == target.get("fid"):
+                    f = item
+                    break
+            if f is not None:
+                break
+            if len(items) < SHARE_PAGE_SIZE or page > 1000:
+                break
+            page += 1
+        if f is None:
+            raise ShareError("分享里的目标文件已变化，请重新解析文件夹")
+        items = [f]
+        data = {}
+        step(f"准备下载 {os.path.basename(f.get('file_name') or target.get('name') or '文件')}…")
+    else:
+        p = {
+            "pwd_id": pwd_id, "stoken": stoken, "pdir_fid": "0", "force": "0",
+            "_page": "1", "_size": str(SHARE_PAGE_SIZE), "_fetch_banner": "1",
+            "_fetch_share": "1", "_fetch_total": "1",
+            "_sort": "file_type:asc,updated_at:desc",
+        }
+        step("读取文件列表…")
+        detail = _api(opener, "/1/clouddrive/share/sharepage/detail", params=p)
+        check()
+        if detail.get("code") not in (0, None):
+            raise ShareError(detail.get("message") or "读取分享列表失败", detail.get("code"))
+        data = detail.get("data") or {}
+        items = data.get("list") or []
+        files = [x for x in items if not x.get("dir")]
+        if not files:
+            raise ShareError("这个分享是文件夹，请使用文件夹下载（或里面没有可下载文件）")
+
+        f = files[0]
     step(f"找到 {f.get('file_name') or '文件'}，正在取直链…")
     dl_body = {
         "fids": [f["fid"]],

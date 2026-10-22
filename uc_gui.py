@@ -438,7 +438,8 @@ class TaskQueue:
 
 
 class DownloadTask:
-    def __init__(self, app, link, pwd_id, passcode, record=None):
+    def __init__(self, app, link, pwd_id, passcode, record=None, target=None,
+                 rel_dir="", rel_path="", queued=False, batch_id=""):
         self.app = app
         self.parsed = None
         self.worker = None
@@ -471,7 +472,7 @@ class DownloadTask:
             except Exception:
                 self.chunk = app.selected_chunk()
             status = record.get("status") or "paused"
-            if status in ("resolving", "downloading", "pausing"):
+            if status in ("resolving", "downloading", "pausing", "queued", "selecting"):
                 status = "paused"
             self.status = status
             self.done = int(record.get("done") or 0)
@@ -481,6 +482,15 @@ class DownloadTask:
             self.completed_at = record.get("completed_at") or ""
             self.trashed = bool(record.get("trashed"))
             self.trashed_at = record.get("trashed_at") or ""
+            self.rel_dir = record.get("rel_dir") or rel_dir
+            self.rel_path = record.get("rel_path") or rel_path or self.title
+            self.batch_id = record.get("batch_id") or batch_id
+            sfid = record.get("share_fid") or ""
+            self.target = ({"fid": sfid,
+                            "parent_fid": record.get("share_parent_fid") or "0",
+                            "name": record.get("share_name") or os.path.basename(self.rel_path),
+                            "size": int(record.get("total") or 0)}
+                           if sfid else target)
         else:
             self.id = f"task-{uuid.uuid4().hex[:10]}"
             self.link = link
@@ -499,8 +509,17 @@ class DownloadTask:
             self.completed_at = ""
             self.trashed = False
             self.trashed_at = ""
+            self.target = target
+            self.rel_dir = rel_dir or ""
+            self.rel_path = rel_path or ""
+            self.batch_id = batch_id or ""
+            if target:
+                self.title = self.rel_path or target.get("name") or self.title
+            if queued:
+                self.status = "queued"
 
         self.passcode = self.code
+        self.filename = os.path.basename(self.rel_path or self.title)
         self.pause_requested = False
         self.stop_event = threading.Event()
         self.cancel_resolve = threading.Event()
@@ -531,6 +550,12 @@ class DownloadTask:
             "completed_at": self.completed_at,
             "trashed": bool(getattr(self, "trashed", False)),
             "trashed_at": getattr(self, "trashed_at", ""),
+            "share_fid": (self.target or {}).get("fid", ""),
+            "share_parent_fid": (self.target or {}).get("parent_fid", ""),
+            "share_name": (self.target or {}).get("name", ""),
+            "rel_dir": getattr(self, "rel_dir", ""),
+            "rel_path": getattr(self, "rel_path", ""),
+            "batch_id": getattr(self, "batch_id", ""),
             "error": self.error,
         }
 
@@ -628,6 +653,12 @@ class DownloadTask:
         if self.status == "resolving":
             text = "解析中…"
             color = "#555555"
+        elif self.status == "selecting":
+            text = "选择要下载的文件…"
+            color = "#555555"
+        elif self.status == "queued":
+            text = "排队中…"
+            color = "#777777"
         elif self.status == "downloading":
             if total:
                 text = (f"{self.done / 1048576:8.1f} / {total / 1048576:.1f} MB"
@@ -657,6 +688,8 @@ class DownloadTask:
 
         if self.status in ("resolving", "downloading"):
             self.btn_pause.configure(text="⏸", state="normal")
+        elif self.status in ("selecting", "queued"):
+            self.btn_pause.configure(text="…", state="disabled")
         elif self.status == "pausing":
             self.btn_pause.configure(text="…", state="disabled")
         elif self.status == "done":
@@ -683,14 +716,44 @@ class DownloadTask:
         self.worker = threading.Thread(target=self._resolve_worker, daemon=True)
         self.worker.start()
 
+    def _apply_target(self, f):
+        self.target = {
+            "fid": f.get("fid"),
+            "parent_fid": f.get("parent_fid") or "0",
+            "name": f.get("name") or os.path.basename(f.get("rel_path") or ""),
+            "size": int(f.get("size") or 0),
+        }
+        self.rel_dir = f.get("rel_dir") or ""
+        self.rel_path = f.get("rel_path") or self.target["name"]
+        self.title = self.rel_path or self.target["name"]
+        self.filename = os.path.basename(self.rel_path or self.target["name"])
+        self.total = int(self.target.get("size") or 0)
+
     def _resolve_worker(self):
         cancel = self.cancel_resolve
+        step = lambda m: self.q.put(("log", m, "info"))
         try:
-            parsed = uc_api.resolve_share(
+            if self.target:
+                parsed = uc_api.resolve_share(
+                    self.pwd_id, self.code, self.app.store.header(),
+                    on_step=step, cancel=cancel, target=self.target)
+                self.q.put(("resolved", parsed))
+                return
+            tree = uc_api.list_share_tree(
                 self.pwd_id, self.code, self.app.store.header(),
-                on_step=lambda m: self.q.put(("log", m, "info")),
-                cancel=cancel)
-            self.q.put(("resolved", parsed))
+                on_step=step, cancel=cancel)
+            files = tree.get("files") or []
+            if not files:
+                raise uc_api.ShareError("这个分享里没有可下载的文件")
+            # 只有“一个普通文件”的分享才自动下；文件夹或多文件先让用户选
+            if len(files) == 1 and not tree.get("has_folders"):
+                self._apply_target(files[0])
+                parsed = uc_api.resolve_share(
+                    self.pwd_id, self.code, self.app.store.header(),
+                    on_step=step, cancel=cancel, target=self.target)
+                self.q.put(("resolved", parsed))
+            else:
+                self.q.put(("folder_tree", tree))
         except uc_api.ShareCancelled:
             self.q.put(("resolve_cancelled", None))
         except Exception as e:
@@ -701,10 +764,11 @@ class DownloadTask:
             self.mark_paused()
             return
         self.parsed = parsed
-        self.title = parsed.get("filename") or self.title
-        self.total = int(parsed.get("size") or 0)
+        self.filename = parsed.get("filename") or os.path.basename(self.rel_path or self.title)
+        self.title = self.rel_path or self.filename
+        self.total = int(parsed.get("size") or self.total or 0)
         if not self.out_path:
-            self.out_path = self.app.pick_out_path(self, self.title)
+            self.out_path = self.app.pick_out_path(self, self.filename)
         self.status = "downloading"
         self.started_at = time.time()
         self.update_row()
@@ -841,6 +905,7 @@ class DownloadTask:
         secs = info.get("seconds") or 0.0
         speed = (self.total / secs / 1048576.0) if secs else 0.0
         self.app.msg(f"[{self.title}] 下载完成：{info.get('path')}（{self.total / 1048576:.1f} MB，{speed:.1f} MB/s）", "ok")
+        self.app.folder_pump()
         if paused_race:
             self.app.msg(f"[{self.title}] 暂停没来得及生效，文件已经下完了。", "warn")
 
@@ -856,6 +921,7 @@ class DownloadTask:
         self.update_row()
         self.persist()
         self.app.msg(f"[{self.title}] 下载失败：{self.error}", "err")
+        self.app.folder_pump()
 
     def on_resolve_failed(self, payload):
         msg, code = payload if isinstance(payload, (tuple, list)) else (str(payload), None)
@@ -877,6 +943,7 @@ class DownloadTask:
         self.update_row()
         self.persist()
         self.app.msg(f"[{self.title}] 解析失败：{self.error}", "err")
+        self.app.folder_pump()
 
     def handle_event(self, ev, epoch=None):
         if epoch is not None and epoch != self.epoch:
@@ -890,6 +957,10 @@ class DownloadTask:
             self.on_progress(ev[1])
         elif kind == "resolved":
             self.on_resolved(ev[1])
+        elif kind == "folder_tree":
+            self.status = "selecting"
+            self.update_row()
+            self.app.choose_folder_files(self, ev[1])
         elif kind == "resolve_cancelled":
             self.mark_paused()
         elif kind == "resolve_failed":
@@ -1154,7 +1225,7 @@ class App:
             try:
                 task.cancel_resolve.set()
                 task.stop_event.set()
-                if task.status in ("resolving", "downloading", "pausing"):
+                if task.status in ("resolving", "downloading", "pausing", "selecting", "queued"):
                     task.status = "paused"
                     task.pause_requested = False
                 self.persist_task(task)
@@ -1240,8 +1311,12 @@ class App:
         if task.out_path:
             return task.out_path
         filename = sanitize(filename)
+        rel_dir = getattr(task, "rel_dir", "") or ""
+        parts = [sanitize(p) for p in rel_dir.replace("\\", "/").split("/")
+                 if p and p not in (".", "..")]
+        target_dir = os.path.join(task.out_dir, *parts) if parts else task.out_dir
         base, ext = os.path.splitext(filename)
-        candidate = os.path.join(task.out_dir, filename)
+        candidate = os.path.join(target_dir, filename)
         used = {os.path.normcase(t.out_path) for t in self.tasks.values()
                 if t is not task and t.out_path}
         if os.path.exists(candidate + ".parts.json") and os.path.normcase(candidate) not in used:
@@ -1306,7 +1381,7 @@ class App:
             task.stop_event.set()
         except Exception:
             pass
-        if not was_done and task.status in ("resolving", "downloading", "pausing"):
+        if not was_done and task.status in ("resolving", "downloading", "pausing", "selecting", "queued"):
             task.status = "paused"
         task.cleanup_running = not was_done
         task.update_row()
@@ -1317,6 +1392,7 @@ class App:
         else:
             self.msg(f"已移到回收站：{task.title}，正在清理未完成文件…（可点 ↩ 恢复）", "warn")
             threading.Thread(target=self._delete_unfinished_files, args=(task,), daemon=True).start()
+        self.folder_pump()
 
     def restore_task(self, task, redownload=False):
         if task.id not in self.tasks or not getattr(task, "trashed", False):
@@ -1362,6 +1438,7 @@ class App:
         self.update_tab_titles()
         self._refresh_scroll()
         self.msg("记录已删除", "warn")
+        self.folder_pump()
 
     def _delete_unfinished_files(self, task):
         """未完成任务进回收站时，连同 .parts.json 和半成品文件一起清掉"""
@@ -1455,6 +1532,161 @@ class App:
                 self.trash_empty.pack(pady=40)
         except Exception:
             pass
+
+    def remove_probe_task(self, probe):
+        if probe.id not in self.tasks:
+            return
+        try:
+            probe.cancel_resolve.set()
+            probe.stop_event.set()
+        except Exception:
+            pass
+        self.tasks.pop(probe.id, None)
+        try:
+            if probe.row is not None:
+                probe.row.destroy()
+        except Exception:
+            pass
+        self.task_store.remove(probe.id)
+        self.update_tab_titles()
+        self._refresh_scroll()
+
+    def folder_pump(self):
+        """文件夹展开出来的任务同一时间只跑一个，避免几十个文件一起抢连接"""
+        if self._closing:
+            return
+        running = [t for t in self.tasks.values()
+                   if getattr(t, "batch_id", "") and not getattr(t, "trashed", False)
+                   and t.status in ("resolving", "downloading")]
+        if running:
+            return
+        for task in self.tasks.values():
+            if (getattr(task, "batch_id", "") and not getattr(task, "trashed", False)
+                    and task.status == "queued"):
+                task.start_resolve()
+                return
+
+    def choose_folder_files(self, probe, folder):
+        if probe.id not in self.tasks or self._closing:
+            return
+        files = folder.get("files") or []
+        if not files:
+            self.remove_probe_task(probe)
+            self.msg("这个文件夹里没有可下载的文件。", "warn")
+            return
+
+        files = sorted(files, key=lambda f: f.get("rel_path") or f.get("name") or "")
+        top = self.tk.Toplevel(self.root)
+        top.title("选择文件夹里的文件")
+        top.geometry("860x560")
+        top.transient(self.root)
+        top.grab_set()
+        result = {"files": None}
+
+        head = self.ttk.Frame(top)
+        head.pack(fill="x", padx=10, pady=(8, 2))
+        title = folder.get("title") or probe.pwd_id
+        self.ttk.Label(head, text=f"「{title}」里共有 {len(files)} 个文件",
+                       font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+        selected = set(range(len(files)))
+
+        self.ttk.Label(top, text="勾选要下载的文件；保留原来的文件夹结构。",
+                       foreground="#666666").pack(anchor="w", padx=10)
+
+        wrap = self.ttk.Frame(top)
+        wrap.pack(fill="both", expand=True, padx=10, pady=4)
+        tv = self.ttk.Treeview(wrap, columns=("sel", "size", "path"), show="headings",
+                               selectmode="none", height=15)
+        tv.heading("sel", text="✓")
+        tv.heading("size", text="大小")
+        tv.heading("path", text="相对路径")
+        tv.column("sel", width=42, anchor="center", stretch=False)
+        tv.column("size", width=92, anchor="e", stretch=False)
+        tv.column("path", width=620, anchor="w")
+        vs = self.ttk.Scrollbar(wrap, command=tv.yview)
+        tv.configure(yscrollcommand=vs.set)
+        tv.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+
+        def fmt(n):
+            return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{n / 1024:.0f} KB"
+
+        for i, f in enumerate(files):
+            tv.insert("", "end", iid=str(i),
+                      values=("☑", fmt(int(f.get("size") or 0)), f.get("rel_path") or f.get("name")))
+
+        total_label = self.ttk.Label(top, text="", foreground="#333333")
+        total_label.pack(anchor="w", padx=10)
+
+        def refresh():
+            total = sum(int(files[i].get("size") or 0) for i in selected)
+            total_label.configure(text=f"已选 {len(selected)} 个文件，共 {fmt(total)}", foreground="#333333")
+            for i in range(len(files)):
+                tv.set(str(i), "sel", "☑" if i in selected else "☐")
+
+        def toggle(i):
+            if i in selected:
+                selected.discard(i)
+            else:
+                selected.add(i)
+            refresh()
+
+        def on_click(event):
+            row = tv.identify_row(event.y)
+            col = tv.identify_column(event.x)
+            if row and col == "#1":
+                toggle(int(row))
+
+        tv.bind("<Button-1>", on_click)
+
+        bar = self.ttk.Frame(top)
+        bar.pack(fill="x", padx=10, pady=(2, 10))
+        self.ttk.Button(bar, text="全选", command=lambda: (selected.update(range(len(files))), refresh())).pack(side="left", padx=2)
+        self.ttk.Button(bar, text="全不选", command=lambda: (selected.clear(), refresh())).pack(side="left", padx=2)
+
+        def do_cancel():
+            result["files"] = None
+            top.destroy()
+
+        def do_start():
+            if not selected:
+                total_label.configure(text="至少选一个文件。", foreground="#c5221f")
+                return
+            result["files"] = [files[i] for i in sorted(selected)]
+            top.destroy()
+
+        self.ttk.Button(bar, text="取消", command=do_cancel).pack(side="right", padx=2)
+        self.ttk.Button(bar, text="下载选中", command=do_start).pack(side="right", padx=2)
+
+        if folder.get("truncated"):
+            self.ttk.Label(top, text="文件较多，只列出了前面一部分。", foreground="#b06000").pack(anchor="w", padx=10)
+        top.protocol("WM_DELETE_WINDOW", do_cancel)
+        refresh()
+        self.root.wait_window(top)
+
+        selected_files = result["files"]
+        self.remove_probe_task(probe)
+        if not selected_files:
+            self.msg("已取消文件夹下载。", "warn")
+            return
+        batch_id = uuid.uuid4().hex
+        for f in selected_files:
+            child = DownloadTask(
+                self, probe.link, probe.pwd_id, probe.code,
+                target={
+                    "fid": f.get("fid"),
+                    "parent_fid": f.get("parent_fid") or "0",
+                    "name": f.get("name") or os.path.basename(f.get("rel_path") or ""),
+                    "size": int(f.get("size") or 0),
+                },
+                rel_dir=f.get("rel_dir") or "",
+                rel_path=f.get("rel_path") or f.get("name") or "",
+                queued=True,
+                batch_id=batch_id,
+            )
+            self.add_task(child)
+        self.msg(f"文件夹「{title}」展开 {len(selected_files)} 个任务，按队列下载…", "ok")
+        self.folder_pump()
 
     def pause_button(self, task):
         if getattr(task, "trashed", False):
@@ -1625,6 +1857,7 @@ class App:
                 task.update_row()
                 task.persist()
                 self.msg(f"[{task.title}] 未输入提取码；任务留在列表里，点 ▶ 可以重试。", "warn")
+                self.folder_pump()
                 return
             code = code.strip()
             if code:
